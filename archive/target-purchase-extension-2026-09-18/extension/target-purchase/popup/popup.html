@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Target Purchase Monitor</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Target monitor</h1>
+          <p id="scheduler-state" class="status warning">Checking scheduler…</p>
+        </div>
+        <button id="run-now" class="quiet" type="button">Run now</button>
+      </header>
+
+      <section class="current">
+        <h2>Current tab</h2>
+        <p id="current-tab">Reading tab…</p>
+        <div class="actions">
+          <button id="arm-product" class="primary" type="button">
+            Arm product tab
+          </button>
+          <button id="arm-checkout" type="button">Arm checkout tab</button>
+          <button id="stop-tab" class="quiet danger" type="button">
+            Stop this tab
+          </button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Settings</h2>
+        <label for="interval-ms">
+          Refresh interval
+          <span>3–300 seconds</span>
+        </label>
+        <div class="field-with-unit">
+          <input
+            id="interval-ms"
+            type="number"
+            min="3000"
+            max="300000"
+            step="1000"
+            value="5000"
+          >
+          <span>ms</span>
+        </div>
+
+        <label for="target-checkout-pin">
+          Target checkout PIN
+          <span>Only used for Confirm your PIN</span>
+        </label>
+        <input
+          id="target-checkout-pin"
+          type="password"
+          inputmode="numeric"
+          autocomplete="off"
+          maxlength="12"
+          placeholder="Optional"
+        >
+        <button id="save-settings" type="button">Save settings</button>
+      </section>
+
+      <section>
+        <div class="section-heading">
+          <h2>Armed tabs</h2>
+          <button id="stop-all" class="quiet danger" type="button">
+            Stop all
+          </button>
+        </div>
+        <ul id="tab-status-list">
+          <li class="empty">No tabs armed.</li>
+        </ul>
+      </section>
+
+      <p id="message" role="status" aria-live="polite"></p>
+    </main>
+
+    <script src="../lib/core.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

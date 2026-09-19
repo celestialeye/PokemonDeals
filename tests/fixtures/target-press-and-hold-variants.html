@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Quick verification</title></head>
+  <body>
+    <h1>Quick verification</h1>
+    <button type="button" aria-label="Press and hold">Press &amp; Hold</button>
+    <p id="status">Verification required</p>
+    <script>
+      const options = new URL(location.href).searchParams;
+      const button = document.querySelector("button");
+      const status = document.querySelector("#status");
+      const requiredMs = Number(options.get("duration") || "800");
+      let timer;
+      let complete = false;
+      const evidence = document.documentElement.dataset;
+      evidence.down = "0";
+      evidence.up = "0";
+      evidence.trusted = "true";
+      const finish = async () => {
+        if (options.has("never")) return;
+        complete = true;
+        if (options.has("processing")) {
+          button.setAttribute("aria-label", "Processing verification");
+          status.textContent = "Processing…";
+          await new Promise((resolve) => setTimeout(resolve, Number(options.get("processing"))));
+        }
+        if (options.has("signal")) await fetch("/fixture-solved");
+        if (options.has("navigate")) {
+          location.href = "/product";
+          return;
+        }
+        if (options.has("detach")) {
+          parent.postMessage("fixture-complete", "*");
+          return;
+        }
+        document.title = "Target product page";
+        document.querySelector("h1").textContent = "Pokemon product";
+        status.textContent = "Verification complete";
+        button.remove();
+      };
+      const cancel = () => {
+        clearTimeout(timer);
+        if (!complete) status.textContent = "Hold longer";
+      };
+      button.addEventListener("pointerdown", (event) => {
+        evidence.down = String(Number(evidence.down) + 1);
+        evidence.trusted = String(evidence.trusted === "true" && event.isTrusted);
+        status.textContent = "Holding…";
+        if (options.has("label")) button.setAttribute("aria-label", "Keep holding");
+        timer = setTimeout(finish, requiredMs);
+      });
+      button.addEventListener("pointerup", cancel);
+      button.addEventListener("pointerleave", cancel);
+      document.addEventListener("pointerup", (event) => {
+        evidence.up = String(Number(evidence.up) + 1);
+        evidence.trusted = String(evidence.trusted === "true" && event.isTrusted);
+      });
+      if (options.has("disabled")) button.disabled = true;
+      if (options.has("duplicate")) button.after(button.cloneNode(true));
+      if (options.has("delay")) {
+        button.hidden = true;
+        setTimeout(() => { button.hidden = false; }, Number(options.get("delay")));
+      }
+    </script>
+  </body>
+</html>

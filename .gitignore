@@ -1,0 +1,20 @@
+node_modules/
+.env
+*.log
+/.chrome-target-test/
+/data/runtime/
+
+# Local, sanitized development-agent handoffs (not a secret store).
+/_workspace/
+
+# Local plaintext purchasing secrets. Never commit or share.
+/data/deals-secrets.local.json
+/data/deals-secrets.local.json.*.tmp
+
+# Local authenticated browser evidence may contain personal checkout details.
+/screenshots/*.png
+/screenshots/*.json
+
+# Archived browser profiles and Playwright captures are local runtime evidence.
+/archive/**/runtime-artifacts/
+/archive/**/.playwright-mcp/

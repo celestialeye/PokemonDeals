@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Quick verification</title>
+  </head>
+  <body>
+    <main role="main">
+      <h1>Quick verification</h1>
+      <p>Press &amp; Hold to confirm you are a human.</p>
+      <button id="press-and-hold" type="button" aria-label="Press and hold">
+        Press &amp; Hold
+      </button>
+      <p id="status">Verification required</p>
+    </main>
+    <script>
+      const button = document.getElementById("press-and-hold");
+      const status = document.getElementById("status");
+      let timer;
+      button.addEventListener("pointerdown", () => {
+        status.textContent = "Holding…";
+        timer = setTimeout(() => {
+          document.title = "Target product page";
+          status.textContent = "Verification complete";
+          document.querySelector("h1").textContent = "Pokemon product";
+          document.querySelector("p").textContent = "Add to cart";
+          button.remove();
+        }, 800);
+      });
+      button.addEventListener("pointerup", () => {
+        clearTimeout(timer);
+        if (status.textContent !== "Verification complete") {
+          status.textContent = "Hold longer";
+        }
+      });
+      button.addEventListener("pointerleave", () => clearTimeout(timer));
+    </script>
+  </body>
+</html>

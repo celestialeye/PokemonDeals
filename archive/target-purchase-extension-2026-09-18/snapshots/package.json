@@ -1,0 +1,30 @@
+{
+  "name": "pokemon-deals",
+  "version": "1.0.0",
+  "description": "Playwright CDP monitors for high-demand Target and Amazon checkout flows",
+  "main": "monitor.js",
+  "scripts": {
+    "test": "npm run test:unit && npm run test:extension-browser",
+    "test:unit": "node tests/target-products.test.js && node tests/pokemoncenter-products.test.js && node tests/amazon-offers.test.js && node tests/amazon-multi-preorder.test.js && node tests/target-extension-core.test.js && node tests/target-extension-scheduler.test.js && node tests/target-extension-background.test.js && node tests/target-extension-product.test.js && node tests/target-extension-checkout.test.js && node tests/target-extension-popup.test.js && node tests/target-extension-install.test.js",
+    "test:extension-browser": "node tests/target-extension-browser.test.js",
+    "target:checkout": "node monitor.js",
+    "target:preorder": "node preorder.js",
+    "pokemoncenter:preorder": "node pokemoncenter-preorder.js",
+    "amazon:preorder": "node amazon-preorder.js",
+    "amazon:multi-preorder": "node amazon-multi-preorder.js",
+    "amazon:checkout": "node amazon-checkout.js",
+    "target-extension:scheduler": "node scripts/target-extension-scheduler.js",
+    "check": "node --check monitor.js && node --check monitor_with_captcha_simulation.js && node --check preorder.js && node --check pokemoncenter-preorder.js && node --check amazon-preorder.js && node --check amazon-multi-preorder.js && node --check amazon-checkout.js && node --check scripts/target-extension-scheduler.js && node --check extension/target-purchase/lib/core.js && node --check extension/target-purchase/background.js && node --check extension/target-purchase/content/shared.js && node --check extension/target-purchase/content/product-monitor.js && node --check extension/target-purchase/content/checkout-monitor.js && node --check extension/target-purchase/popup/popup.js && node --check tests/target-extension-core.test.js && node --check tests/target-extension-scheduler.test.js && node --check tests/target-extension-background.test.js && node --check tests/target-extension-product.test.js && node --check tests/target-extension-checkout.test.js && node --check tests/target-extension-popup.test.js && node --check tests/target-extension-install.test.js && node --check tests/target-extension-browser.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "playwright-core": "^1.63.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1"
+  }
+}
