@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "116",
+  "name": "Target Purchase Monitor",
+  "version": "0.1.0",
+  "description": "One monitor per Target product tab and one independent checkout worker.",
+  "permissions": [
+    "activeTab",
+    "alarms",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://www.target.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Target Purchase Monitor"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.target.com/p/*"
+      ],
+      "js": [
+        "lib/core.js",
+        "content/shared.js",
+        "content/product-monitor.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.target.com/*"
+      ],
+      "js": [
+        "lib/core.js",
+        "content/shared.js",
+        "content/checkout-monitor.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:18765"
+  }
+}

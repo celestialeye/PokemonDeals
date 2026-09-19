@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Target product available</title>
+  </head>
+  <body>
+    <main>
+      <h1>Simulated Pokémon product</h1>
+      <section data-test="module-product-detail-add-to-cart">
+        <button id="purchase">Preorder</button>
+      </section>
+      <div id="result" role="status" data-test="add-to-cart-toast"></div>
+    </main>
+    <script>
+      window.__purchaseClicks = 0;
+      document.getElementById("purchase").addEventListener("click", () => {
+        window.__purchaseClicks += 1;
+        document.getElementById("result").textContent = "Added to cart";
+      });
+    </script>
+  </body>
+</html>
