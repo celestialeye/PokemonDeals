@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Playwright CDP monitors for high-demand Target and Amazon checkout flows",
   "main": "monitor.js",
+  "bin": {
+    "pokemon": "./deals.js"
+  },
   "scripts": {
     "test": "npm run test:unit",
     "test:unit": "node --test tests/deals.test.js && node tests/target-products.test.js && node --test tests/target-checkout.test.js && node tests/global-request-queue.test.js && node tests/target-availability.test.js && node tests/target-challenge.test.js && node tests/target-challenge-page.test.js && node tests/target-challenge-solver.test.js && node tests/target-watch-challenge.test.js && node tests/target-preorder-discovery.test.js && node tests/pokemoncenter-products.test.js && node tests/amazon-offers.test.js && node tests/amazon-multi-preorder.test.js",

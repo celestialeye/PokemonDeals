@@ -39,7 +39,15 @@ npm run check
 
 ## Deals purchasing engine
 
-`npm run deals` opens the interactive control plane for the versioned
+Install the local command once:
+
+```powershell
+npm link
+```
+
+After that, `pokemon` opens the interactive control plane from any PowerShell
+directory. `npm run deals` remains available as a repository-local fallback.
+The purchasing engine uses the versioned
 `data\deals.json` catalog. It can list, add, paste/import, edit, arm/disarm,
 delete, configure settings/secrets, and run products. The main catalog contains
 product metadata, non-sensitive settings, and status only. The separate ignored
@@ -50,7 +58,7 @@ checkout URLs are never stored by the CLI.
 Quickest workflow:
 
 ```powershell
-npm run deals
+pokemon
 ```
 
 1. Choose **Paste/import grouped list** or **Add product**.
@@ -87,28 +95,28 @@ Direct commands use stable IDs; any unique ID prefix shown by `list` is
 accepted:
 
 ```powershell
-npm run deals -- list
-npm run deals -- settings
-npm run deals -- settings set target.max-item-price 49.99
-npm run deals -- settings set target.max-order-total 60.00
-npm run deals -- settings set target.expected-fulfillment shipping
-npm run deals -- settings set target.default-run-mode observe
-npm run deals -- secrets
-npm run deals -- secrets set target.pin "<value>"
-npm run deals -- secrets set discord.webhook-url "<value>"
-npm run deals -- secrets show
-npm run deals -- secrets clear target.pin
-npm run deals -- add --name "Elite Trainer Box" --group "30th Celebration" --url "howl.link/99668grkawccg" --mode preorder
-npm run deals -- import --file ".\products.txt" --mode buy --disarmed
-Get-Content ".\products.txt" | npm run deals -- import --mode buy-now --armed
-npm run deals -- edit abc123 --name "Updated name" --mode buy
-npm run deals -- arm abc123 def456
-npm run deals -- disable abc123
-npm run deals -- remove abc123
-npm run deals -- monitor --execution observe-only
-npm run deals -- run --execution stop-before-submit
-npm run deals -- monitor --execution live-purchase
-npm run deals -- monitor --execution observe-only --no-solver
+pokemon list
+pokemon settings
+pokemon settings set target.max-item-price 49.99
+pokemon settings set target.max-order-total 60.00
+pokemon settings set target.expected-fulfillment shipping
+pokemon settings set target.default-run-mode observe
+pokemon secrets
+pokemon secrets set target.pin "<value>"
+pokemon secrets set discord.webhook-url "<value>"
+pokemon secrets show
+pokemon secrets clear target.pin
+pokemon add --name "Elite Trainer Box" --group "30th Celebration" --url "howl.link/99668grkawccg" --mode preorder
+pokemon import --file ".\products.txt" --mode buy --disarmed
+Get-Content ".\products.txt" | pokemon import --mode buy-now --armed
+pokemon edit abc123 --name "Updated name" --mode buy
+pokemon arm abc123 def456
+pokemon disable abc123
+pokemon remove abc123
+pokemon monitor --execution observe-only
+pokemon run --execution stop-before-submit
+pokemon monitor --execution live-purchase
+pokemon monitor --execution observe-only --no-solver
 ```
 
 `enable`/`disable` are aliases for `arm`/`disarm`, and `run` is an alias for
@@ -126,8 +134,8 @@ Target defaults and are upgraded on the next write. Use the interactive
 **Settings** menu or:
 
 ```powershell
-npm run deals -- settings
-npm run deals -- settings set target.<key> <value>
+pokemon settings
+pokemon settings set target.<key> <value>
 ```
 
 | Key | Default | Validation |
@@ -165,9 +173,9 @@ Windows account and filesystem permissions. Never commit, share, attach, or
 copy it into logs or support reports. No encryption or operating-system
 keychain is used.
 
-The normal Settings screen and `npm run deals -- secrets` mask stored values and
+The normal Settings screen and `pokemon secrets` mask stored values and
 show whether a process-environment override is present. The explicit
-`npm run deals -- secrets show` command and **Reveal stored secrets** menu action
+`pokemon secrets show` command and **Reveal stored secrets** menu action
 print the stored values; use them only in a private terminal. Secret-setting
 commands confirm the key but do not echo the supplied value. Supplying a value
 on the command line can still place it in shell history, so the interactive
