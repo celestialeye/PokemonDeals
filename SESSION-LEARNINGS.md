@@ -13,13 +13,26 @@ The reliable sequence was:
 
 ## Deals purchasing control plane
 
-The dependency-free `deals.js` CLI is the operator-facing purchasing engine.
+The `deals.js` CLI is the operator-facing purchasing engine. Its no-argument
+path lazily loads the focused `neo-blessed` full-screen application from
+`src\deals-tui.js`; direct subcommands do not load the TUI and retain their
+plain-text output.
 It owns the versioned `data\deals.json` catalog, retailer-scoped non-sensitive
 settings, stable IDs, explicit product modes, armed state, execution-mode
 choice, live status, terminal outcome, and child-process lifecycle. Retailer
 adapters own URL recognition, per-retailer armed limits, setting defaults and
 validation, worker arguments, secret-name validation, and output-event parsing.
 This keeps retailer-specific purchase behavior out of the CLI.
+
+The TUI/controller boundary is intentionally one-way. The TUI builds product
+rows and detail views, handles keyboard navigation and modal workflows, and
+projects bounded control-character-stripped logs. Catalog CRUD, grouped-list
+parsing, retailer metadata, settings validation, secret masking/storage,
+execution preflight, worker spawning, output parsing, and runtime persistence
+remain in their existing modules. `runAdapter()` emits lifecycle notifications
+plus parsed product events after using the adapter parser, matching catalog
+items, and persisting their state; the TUI never reparses worker output. The
+old numbered readline loop is no longer the no-argument experience.
 
 The first registry entry is Target. User mode **Buy** maps to the existing
 Target `add-to-cart` mode; **Buy Now** and **Preorder** map directly. The engine
@@ -43,7 +56,7 @@ loops.
 
 Target engine runs expose challenge recovery as a first-class option. The
 bundled `./target-challenge-solver.js` is enabled by default, including from the
-interactive menu and `settings.target.solverEnabled`, and `--no-solver`
+full-screen run setup and `settings.target.solverEnabled`, and `--no-solver`
 explicitly disables it for one run. The adapter sets
 `TARGET_CHALLENGE_SOLVER` and, for solver-backed observe-only runs,
 `TARGET_CHALLENGE_VALIDATE=1`. Existing challenge hold, timeout, settle,
@@ -90,8 +103,10 @@ price ceilings and checks for an effective Discord webhook without logging its
 value. Explicit process-environment secrets take precedence over stored values
 for one-off runs. The normal settings view masks stored secrets and reports
 environment override presence; only the explicit reveal action displays stored
-values. Worker stdout/stderr is streamed unchanged so checkout errors and
-safety stops remain visible. Existing
+values. Direct commands stream worker stdout/stderr unchanged; the TUI shows a
+bounded, terminal-control-stripped projection so checkout errors and safety
+stops remain visible without allowing worker text to control the interface.
+Existing
 structured and plain Target events update per-item status through product IDs
 or short-link resolution; explicit confirmation and terminal safety stops are
 stored distinctly. A click, cart add, ready-to-submit stop, ambiguous outcome,
@@ -110,10 +125,14 @@ enforcement, settings-to-Target environment construction, secret-presence
 redaction/reveal behavior, secret persistence and environment precedence,
 `.gitignore` coverage, and Target output parsing. Those tests do not spawn
 `target-watch.js`, attach to CDP, contact a retailer, send Discord alerts,
-exercise a challenge, mutate a cart, or validate a live order. Interactive
-terminal rendering, authenticated short-link resolution, Ctrl+C cleanup against
-a real worker, and all three live execution modes remain deliberate
-operator-validation gaps.
+exercise a challenge, mutate a cart, or validate a live order. Pure and
+synthetic tests now cover TUI rows/details, keyboard action mapping, run
+defaults, grouped-import controller transitions, minimum-size projection, and
+bounded safe event/log projection. Full visual rendering in Windows
+Terminal, focus behavior across every `neo-blessed` widget, clickable URL
+recognition, authenticated short-link resolution, Ctrl+C cleanup against a real
+worker, and all three live execution modes remain deliberate operator-validation
+gaps. No retailer worker or CDP session is started by the TUI tests.
 
 ## Approaches that did not work
 

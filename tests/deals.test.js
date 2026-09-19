@@ -6,9 +6,6 @@ const path = require("node:path");
 const test = require("node:test");
 const {
   challengeSolverOption,
-  collectPaste,
-  completeInteractiveImport,
-  interactiveRunOptions,
   matchEventItems,
   printSettings,
   printSecrets,
@@ -126,84 +123,6 @@ Future item: example.com/products/future
     parseGroupedList("not a product line").errors[0],
     /expected "Name: URL"/i,
   );
-});
-
-test("interactive paste allows blank separators and ends on two blank lines", async () => {
-  const answers = [
-    "Group one:",
-    "First: example.com/first",
-    "",
-    "Group two:",
-    "Second: example.com/second",
-    "",
-    "",
-  ];
-  const text = await collectPaste(
-    { question: async () => answers.shift() },
-    { write: () => {} },
-  );
-  assert.match(text, /First: example\.com\/first\r?\n\r?\nGroup two:/);
-  assert.match(text, /Second: example\.com\/second$/);
-});
-
-test("interactive import reprompts blank mode and never persists null", async () => {
-  const answers = ["", "Buy", "no", "yes"];
-  const persisted = [];
-  let errors = "";
-  const added = await completeInteractiveImport(
-    {
-      addMany: async (items) => {
-        persisted.push(...items);
-        return items;
-      },
-    },
-    {
-      question: async () => answers.shift(),
-    },
-    {
-      items: [{
-        name: "Example",
-        group: "Group",
-        url: "https://example.com/item",
-      }],
-    },
-    {
-      output: { write: () => {} },
-      errorOutput: { write: (value) => { errors += value; } },
-    },
-  );
-  assert.equal(added.length, 1);
-  assert.equal(persisted[0].mode, "buy");
-  assert.notEqual(persisted[0].mode, null);
-  assert.match(errors, /Mode must be Buy Now, Preorder, or Buy/);
-});
-
-test("interactive import can cancel after blank mode without persistence", async () => {
-  let persisted = false;
-  const answers = ["", "cancel"];
-  const added = await completeInteractiveImport(
-    {
-      addMany: async () => {
-        persisted = true;
-      },
-    },
-    {
-      question: async () => answers.shift(),
-    },
-    {
-      items: [{
-        name: "Example",
-        group: "",
-        url: "https://example.com/item",
-      }],
-    },
-    {
-      output: { write: () => {} },
-      errorOutput: { write: () => {} },
-    },
-  );
-  assert.deepEqual(added, []);
-  assert.equal(persisted, false);
 });
 
 test("URL normalization, retailer detection, and mode mapping are explicit", () => {
@@ -447,24 +366,6 @@ test("local secret store is covered by gitignore", async () => {
   );
   assert.match(gitignore, /^\/data\/deals-secrets\.local\.json$/m);
   assert.match(gitignore, /^\/data\/deals-secrets\.local\.json\.\*\.tmp$/m);
-});
-
-test("interactive run options come from the armed retailer adapter", async () => {
-  const answers = [""];
-  const options = await interactiveRunOptions(
-    {
-      list: async () => [{ retailer: "target", armed: true }],
-      getSettings: async () => targetSettingsDefaults,
-    },
-    {
-      question: async () => answers.shift(),
-    },
-  );
-  assert.deepEqual(options, {
-    target: {
-      challengeSolver: true,
-    },
-  });
 });
 
 test("catalog CRUD is atomic, rejects duplicates, and resolves unique prefixes", async () => {
@@ -1041,6 +942,81 @@ test("status matching and displayed ID prefixes stay scoped and unambiguous", ()
   assert.equal(retailerLabel("future"), "Unsupported");
 });
 
+test("run adapter emits already-parsed matched events without changing output", async () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => true;
+  const item = {
+    id: "item1",
+    retailer: "target",
+    armed: true,
+    resolvedProductId: "A-1000000001",
+    terminalOutcome: null,
+  };
+  let current = { ...item };
+  const notifications = [];
+  const lifecycle = [];
+  let output = "";
+  const adapter = {
+    id: "target",
+    displayName: "Target",
+    validateEnvironment: () => [],
+    buildRun: () => ({
+      command: process.execPath,
+      args: ["synthetic-worker.js"],
+      env: {},
+    }),
+    parseOutput: parseTargetOutput,
+  };
+  const store = {
+    updateRuntime: async (ids, patch) => {
+      if (ids.includes(current.id)) {
+        current = { ...current, ...patch };
+      }
+    },
+    list: async () => [current],
+  };
+  const result = runAdapter(
+    store,
+    adapter,
+    [item],
+    "observe-only",
+    {
+      spawnImpl: () => {
+        setImmediate(() => {
+          child.stdout.emit(
+            "data",
+            Buffer.from(
+              'TARGET_API_POLL {"productId":"A-1000000001","status":200,"outcome":"response"}\n',
+            ),
+          );
+          setImmediate(() => child.emit("close", 0, null));
+        });
+        return child;
+      },
+      output: { write: (chunk) => { output += chunk; } },
+      errorOutput: { write: () => {} },
+      env: {},
+      onRunEvent: (event) => notifications.push(event),
+      onLifecycle: (event) => lifecycle.push(event),
+    },
+  );
+  assert.deepEqual(await result, {
+    code: 0,
+    signal: null,
+    interrupted: false,
+  });
+  assert.match(output, /TARGET_API_POLL/);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].event.status, "Monitoring (HTTP 200)");
+  assert.deepEqual(notifications[0].itemIds, ["item1"]);
+  assert.deepEqual(
+    lifecycle.map((event) => event.type),
+    ["starting", "closed"],
+  );
+});
+
 test("runtime persistence failure stops the child before rejecting", async () => {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
@@ -1092,3 +1068,89 @@ test("runtime persistence failure stops the child before rejecting", async () =>
   assert.equal(updateCalls, 1);
   assert.deepEqual(signals, ["SIGINT"]);
 });
+
+test("repeated stop requests remain intercepted until the child closes", async () => {
+  const child = new EventEmitter();
+  const signalSource = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  const signals = [];
+  child.kill = (signal) => {
+    signals.push(signal || "default");
+    return true;
+  };
+  const adapter = {
+    id: "target",
+    displayName: "Target",
+    validateEnvironment: () => [],
+    buildRun: () => ({
+      command: process.execPath,
+      args: ["synthetic-worker.js"],
+      env: {},
+    }),
+    parseOutput: () => null,
+  };
+  const item = {
+    id: "item1",
+    retailer: "target",
+    armed: true,
+    terminalOutcome: null,
+  };
+  let current = { ...item };
+  const store = {
+    updateRuntime: async (ids, patch) => {
+      if (ids.includes(current.id)) {
+        current = { ...current, ...patch };
+      }
+    },
+    list: async () => [current],
+  };
+  const resultPromise = runAdapter(
+    store,
+    adapter,
+    [item],
+    "observe-only",
+    {
+      spawnImpl: () => child,
+      output: { write: () => {} },
+      errorOutput: { write: () => {} },
+      env: {},
+      signalSource,
+    },
+  );
+  await waitForSignalListener(signalSource, 1);
+  signalSource.emit("SIGINT");
+  signalSource.emit("SIGINT");
+  assert.deepEqual(signals, ["SIGINT"]);
+  assert.equal(signalSource.listenerCount("SIGINT"), 1);
+
+  let settled = false;
+  resultPromise.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+
+  child.emit("close", 0, "SIGINT");
+  assert.deepEqual(await resultPromise, {
+    code: 0,
+    signal: "SIGINT",
+    interrupted: true,
+  });
+  assert.equal(signalSource.listenerCount("SIGINT"), 0);
+});
+
+async function waitForSignalListener(signalSource, expectedCount) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (signalSource.listenerCount("SIGINT") === expectedCount) {
+      return;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail(`Timed out waiting for ${expectedCount} SIGINT listener(s).`);
+}

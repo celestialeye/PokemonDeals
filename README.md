@@ -4,6 +4,55 @@ Playwright scripts for monitoring high-demand Pokemon product and checkout flows
 
 These scripts can add products to a cart and submit real orders. Run them only when you intend to make a purchase, verify the active cart, shipping address, payment method, and quantities first, and stop duplicate workers after one order succeeds.
 
+## Full-screen purchasing control plane
+
+Install dependencies and link the local command once, then launch the terminal
+application with no arguments:
+
+```powershell
+npm install
+npm link
+pokemon
+```
+
+`pokemon` opens a persistent full-screen interface with a catalog header, left
+navigation, product table, selected-product detail, and footer shortcuts. It
+requires an interactive terminal of at least 90 columns by 28 rows; smaller
+windows show a resize message instead of overlapping controls. The primary
+keyboard map is always visible:
+
+| Key | Action |
+|---|---|
+| arrows or `j`/`k` | Move through products, settings, secrets, and run choices |
+| `Enter` | Open or confirm the selected action |
+| `Space` | Arm or disarm the selected product |
+| `a` / `e` / `i` / `d` | Add, edit, import, or delete |
+| `r` / `s` | Open run setup or Target settings |
+| `Esc` | Close a modal or return to Products |
+| `q` | Quit when no worker is active |
+| `Ctrl+C` | Stop an active child worker through the existing cleanup path |
+
+The **Products** screen shows armed state, product mode, retailer, name, group,
+status, and last check. Its detail pane keeps the complete raw URL and resolved
+URL visible so Windows Terminal can recognize and open them. **Add** and
+**Edit** use centered forms. **Import** accepts the grouped list format in a
+multiline paste window, then requires preview, one product mode, an armed
+choice, and confirmation. **Settings** edits the navigable Target setting list
+with existing validation. **Secrets** masks values and requires separate
+set/clear/reveal actions.
+
+**Run Engine** lists armed products and offers Observe, Stop before submit
+(default), and Live purchase. It also exposes the stored solver default.
+Live purchase requires typing `LIVE` in a confirmation that summarizes
+products, product modes, price limits, fulfillment, and solver state. During a
+run, the application shows per-product status and a bounded scrolling worker
+log. The TUI consumes the existing engine/adapters and does not reimplement
+retailer parsing, checkout, or safety guards.
+
+All existing direct subcommands remain available and retain their plain-text
+output for scripts, redirected input, and automation; see
+[Direct commands](#direct-commands).
+
 ## Scripts
 
 - `monitor.js`: Target checkout state machine. Handles cart redirects, shipping retries, high-demand dialogs, PIN confirmation, and repeated order submission until confirmation.
@@ -37,7 +86,7 @@ Validate the scripts:
 npm run check
 ```
 
-## Deals purchasing engine
+## Deals purchasing engine reference
 
 Install the local command once:
 
@@ -45,7 +94,7 @@ Install the local command once:
 npm link
 ```
 
-After that, `pokemon` opens the interactive control plane from any PowerShell
+After that, `pokemon` opens the full-screen control plane from any PowerShell
 directory. `npm run deals` remains available as a repository-local fallback.
 The purchasing engine uses the versioned
 `data\deals.json` catalog. It can list, add, paste/import, edit, arm/disarm,
@@ -55,23 +104,10 @@ product metadata, non-sensitive settings, and status only. The separate ignored
 webhook; cookies, authentication, payment data, card details, addresses, and
 checkout URLs are never stored by the CLI.
 
-Quickest workflow:
-
-```powershell
-pokemon
-```
-
-1. Choose **Paste/import grouped list** or **Add product**.
-2. Select one explicit product mode: **Buy Now**, **Preorder**, or **Buy**.
-   Blank or invalid import modes are rejected; type `cancel` to abort without
-   saving.
-3. Open **Settings** and set `target.max-item-price` and
-   `target.max-order-total` before an active run.
-4. In **Settings**, optionally store the Target PIN and required Discord
-   webhook. They are masked unless **Reveal stored secrets** is selected.
-5. Review the catalog table, then arm up to three Target products.
-6. Choose **Start engine**. The initial default execution mode is
-   `stop-before-submit`.
+Start with **Add Product** or **Import**, choose an explicit Buy Now, Preorder,
+or Buy product mode, configure price limits and secrets, arm up to three Target
+products, and review **Run Engine**. The initial execution mode is
+`stop-before-submit`.
 
 Grouped paste input uses headings ending in `:` and `Name: URL` product lines.
 Missing `https://` is added before preview:
@@ -88,8 +124,10 @@ Future item: example.com/products/future
 The preview is shown before the interactive import requires one product mode
 and asks for armed state. Unsupported retailer URLs can be stored for future
 adapters, but they cannot be armed or run.
-Paste may contain blank separators between groups; submit two consecutive blank
-lines to finish interactive input.
+Paste may contain blank separators between groups. Use F2 to preview the
+multiline import, then select its required mode and armed state before saving.
+
+### Direct commands
 
 Direct commands use stable IDs; any unique ID prefix shown by `list` is
 accepted:
@@ -130,8 +168,7 @@ explicitly enable it.
 
 Non-sensitive settings are stored under the top-level `settings.target` object
 in version 2 of `data\deals.json`. Existing version 1 catalogs are read with
-Target defaults and are upgraded on the next write. Use the interactive
-**Settings** menu or:
+Target defaults and are upgraded on the next write. Use the full-screen **Settings** screen or:
 
 ```powershell
 pokemon settings
@@ -173,9 +210,9 @@ Windows account and filesystem permissions. Never commit, share, attach, or
 copy it into logs or support reports. No encryption or operating-system
 keychain is used.
 
-The normal Settings screen and `pokemon secrets` mask stored values and
+The normal Secrets screen and `pokemon secrets` mask stored values and
 show whether a process-environment override is present. The explicit
-`pokemon secrets show` command and **Reveal stored secrets** menu action
+`pokemon secrets show` command and `v` reveal action
 print the stored values; use them only in a private terminal. Secret-setting
 commands confirm the key but do not echo the supplied value. Supplying a value
 on the command line can still place it in shell history, so the interactive
@@ -207,9 +244,9 @@ Execution modes, selectable per run or through
   Place order.
 - `live-purchase`: leaves both gates unset and can submit a real order.
 
-Interactive engine runs ask whether to use bundled Target Press & Hold recovery
-and default to the persisted `target.solver-enabled` setting, initially
-**yes**. The CLI sets `TARGET_CHALLENGE_SOLVER` to
+Full-screen engine setup exposes bundled Target Press & Hold recovery and
+defaults to the persisted `target.solver-enabled` setting, initially **yes**.
+The CLI sets `TARGET_CHALLENGE_SOLVER` to
 `./target-challenge-solver.js`; disabling recovery removes both that setting and
 `TARGET_CHALLENGE_VALIDATE` from the child environment. Existing
 `TARGET_CHALLENGE_SOLVE_ATTEMPTS`, `TARGET_CHALLENGE_SETTLE_MS`,

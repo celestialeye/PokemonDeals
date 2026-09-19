@@ -2,7 +2,6 @@
 
 const fs = require("node:fs/promises");
 const path = require("node:path");
-const readline = require("node:readline/promises");
 const { spawn } = require("node:child_process");
 const { stdin, stdout, stderr } = require("node:process");
 const {
@@ -256,7 +255,10 @@ async function runAdapter(store, adapter, items, executionMode, {
   spawnImpl = spawn,
   output = stdout,
   errorOutput = stderr,
+  onRunEvent = () => {},
+  onLifecycle = () => {},
   env = process.env,
+  signalSource = process,
   secrets = emptySecrets().secrets,
   settings = adapter.settings?.defaults || {},
 } = {}) {
@@ -277,6 +279,12 @@ async function runAdapter(store, adapter, items, executionMode, {
   output.write(
     `Starting ${adapter.displayName} in ${executionMode} mode${solverStatus}.\n`,
   );
+  onLifecycle({
+    type: "starting",
+    retailer: adapter.id,
+    mode: executionMode,
+    itemIds: items.map((item) => item.id),
+  });
   await store.updateRuntime(
     items.map((item) => item.id),
     {
@@ -300,11 +308,13 @@ async function runAdapter(store, adapter, items, executionMode, {
     let activeProductId = null;
     let updateChain = Promise.resolve();
     let forceTimer = null;
+    let stopping = false;
 
     const stopChild = () => {
-      if (closed) {
+      if (closed || stopping) {
         return;
       }
+      stopping = true;
       try {
         child.kill("SIGINT");
       } catch (error) {
@@ -365,6 +375,13 @@ async function runAdapter(store, adapter, items, executionMode, {
             matched.map((item) => item.id),
             patch,
           );
+          onRunEvent({
+            retailer: adapter.id,
+            line,
+            event,
+            itemIds: matched.map((item) => item.id),
+            at: patch.lastStatusAt,
+          });
         }
       });
     };
@@ -387,10 +404,10 @@ async function runAdapter(store, adapter, items, executionMode, {
       errorOutput.write(`\nStopping ${adapter.displayName} worker...\n`);
       stopChild();
     };
-    process.once("SIGINT", onInterrupt);
+    signalSource.on("SIGINT", onInterrupt);
 
     child.once("error", (error) => {
-      process.removeListener("SIGINT", onInterrupt);
+      signalSource.removeListener("SIGINT", onInterrupt);
       if (forceTimer) {
         clearTimeout(forceTimer);
       }
@@ -406,7 +423,7 @@ async function runAdapter(store, adapter, items, executionMode, {
     });
     child.once("close", (code, signal) => {
       closed = true;
-      process.removeListener("SIGINT", onInterrupt);
+      signalSource.removeListener("SIGINT", onInterrupt);
       if (forceTimer) {
         clearTimeout(forceTimer);
       }
@@ -441,6 +458,15 @@ async function runAdapter(store, adapter, items, executionMode, {
               },
             );
           }
+          onLifecycle({
+            type: "closed",
+            retailer: adapter.id,
+            mode: executionMode,
+            itemIds: [...startedIds],
+            code,
+            signal,
+            interrupted,
+          });
           resolve({ code, signal, interrupted });
         })
         .catch(reject);
@@ -547,262 +573,6 @@ async function runEngine(store, executionMode, options = {}) {
   return { code: 0, signal: null, interrupted: false };
 }
 
-async function collectPaste(rl, output = stdout) {
-  output.write(
-    'Paste grouped products as "Name: URL"; headings end in ":". Submit two blank lines when finished.\n',
-  );
-  const lines = [];
-  let blankLines = 0;
-  while (true) {
-    const line = await rl.question(lines.length === 0 ? "> " : "");
-    if (!line.trim()) {
-      blankLines += 1;
-      if (blankLines === 2) {
-        lines.pop();
-        break;
-      }
-      lines.push("");
-      continue;
-    }
-    blankLines = 0;
-    lines.push(line);
-  }
-  return lines.join("\n");
-}
-
-function parseYesNo(value, defaultValue) {
-  const normalized = String(value || "").trim().toLowerCase();
-  if (!normalized) {
-    return defaultValue;
-  }
-  if (["y", "yes"].includes(normalized)) {
-    return true;
-  }
-  if (["n", "no"].includes(normalized)) {
-    return false;
-  }
-  throw new Error('Enter "yes" or "no".');
-}
-
-async function promptImportMode(rl, {
-  errorOutput = stderr,
-} = {}) {
-  while (true) {
-    const answer = await rl.question(
-      'Mode (Buy Now, Preorder, or Buy; type "cancel" to abort): ',
-    );
-    if (/^cancel$/i.test(answer.trim())) {
-      return null;
-    }
-    try {
-      return normalizeMode(answer);
-    } catch (error) {
-      errorOutput.write(`Error: ${error.message}\n`);
-    }
-  }
-}
-
-async function completeInteractiveImport(store, rl, parsed, {
-  output = stdout,
-  errorOutput = stderr,
-} = {}) {
-  printImportPreview(parsed.items, output);
-  const mode = await promptImportMode(rl, { errorOutput });
-  if (!mode) {
-    output.write("Import canceled.\n");
-    return [];
-  }
-  const armed = /^(?:y|yes)$/i.test(
-    await rl.question("Arm imported products? [y/N]: "),
-  );
-  if (!/^(?:y|yes)$/i.test(await rl.question("Import these products? [y/N]: "))) {
-    output.write("Import canceled.\n");
-    return [];
-  }
-  const added = await store.addMany(
-    parsed.items.map((item) => ({ ...item, mode, armed })),
-  );
-  output.write(`Imported ${added.length} product(s).\n`);
-  return added;
-}
-
-async function questionSecret(rl, prompt) {
-  if (typeof rl._writeToOutput !== "function") {
-    return rl.question(prompt);
-  }
-  const writeToOutput = rl._writeToOutput;
-  stdout.write(prompt);
-  rl._writeToOutput = () => {};
-  try {
-    return await rl.question("");
-  } finally {
-    rl._writeToOutput = writeToOutput;
-    stdout.write("\n");
-  }
-}
-
-async function interactiveSettings(store, secretStore, rl) {
-  while (true) {
-    await printSettings(store, { secretStore });
-    stdout.write(
-      "\n1. Set setting\n" +
-      "2. Set secret\n" +
-      "3. Clear secret\n" +
-      "4. Reveal stored secrets\n" +
-      "5. Back\n",
-    );
-    const choice = (await rl.question("Choose: ")).trim();
-    if (choice === "5") {
-      return;
-    }
-    try {
-      if (choice === "1") {
-        const qualifiedKey = (await rl.question(
-          "Setting key (for example target.poll-interval-ms): ",
-        )).trim();
-        const value = await rl.question("Value: ");
-        const separator = qualifiedKey.indexOf(".");
-        if (separator <= 0) {
-          throw new Error("Setting key must include its retailer namespace.");
-        }
-        const retailer = qualifiedKey.slice(0, separator).toLowerCase();
-        const key = qualifiedKey.slice(separator + 1);
-        await store.setSetting(retailer, key, value);
-        stdout.write(`Updated ${qualifiedKey}.\n`);
-      } else if (choice === "2") {
-        const key = await rl.question(
-          "Secret key (target.pin or discord.webhook-url): ",
-        );
-        const value = await questionSecret(rl, "Secret value: ");
-        const storedKey = await secretStore.set(key, value);
-        stdout.write(`Stored ${storedKey}.\n`);
-      } else if (choice === "3") {
-        const key = await rl.question(
-          "Secret key (target.pin or discord.webhook-url): ",
-        );
-        const clearedKey = await secretStore.clear(key);
-        stdout.write(`Cleared ${clearedKey}.\n`);
-      } else if (choice === "4") {
-        await printSecrets(secretStore, { reveal: true });
-      } else {
-        stderr.write("Error: Choose a number from 1 to 5.\n");
-      }
-    } catch (error) {
-      stderr.write(`Error: ${error.message}\n`);
-    }
-  }
-}
-
-async function interactiveRunOptions(store, rl) {
-  const armed = (await store.list()).filter((item) => item.armed);
-  const adapterOptions = {};
-  for (const retailer of [...new Set(armed.map((item) => item.retailer))]) {
-    const adapter = adapterForRetailer(retailer);
-    if (!adapter) {
-      continue;
-    }
-    const settings = await store.getSettings(retailer);
-    const prompts = adapter.runOptionPrompts?.(settings) || [];
-    for (const prompt of prompts) {
-      adapterOptions[retailer] ||= {};
-      adapterOptions[retailer][prompt.key] = parseYesNo(
-        await rl.question(
-          `${prompt.label} [${prompt.defaultValue ? "Y/n" : "y/N"}]: `,
-        ),
-        prompt.defaultValue,
-      );
-    }
-  }
-  return adapterOptions;
-}
-
-async function interactiveMenu(store, secretStore) {
-  const rl = readline.createInterface({ input: stdin, output: stdout });
-  try {
-    while (true) {
-      stdout.write(
-        "\nDeals purchasing engine\n" +
-        "1. List products\n" +
-        "2. Add product\n" +
-        "3. Paste/import grouped list\n" +
-        "4. Edit product\n" +
-        "5. Arm/disarm product\n" +
-        "6. Delete product\n" +
-        "7. Start engine\n" +
-        "8. Settings\n" +
-        "9. Exit\n",
-      );
-      const choice = (await rl.question("Choose: ")).trim();
-      try {
-        if (choice === "1") {
-          printProducts(await store.list());
-        } else if (choice === "2") {
-          const name = await rl.question("Name: ");
-          const group = await rl.question("Group (optional): ");
-          const url = await rl.question("URL: ");
-          const mode = normalizeMode(await rl.question("Mode (Buy Now, Preorder, Buy): "));
-          const armed = /^(?:y|yes)$/i.test(await rl.question("Arm now? [y/N]: "));
-          const item = await store.add({ name, group, url, mode, armed });
-          stdout.write(`Added ${item.id} ${item.name}.\n`);
-        } else if (choice === "3") {
-          const parsed = parseGroupedList(await collectPaste(rl));
-          if (parsed.errors.length > 0) {
-            throw new Error(parsed.errors.join("\n"));
-          }
-          await completeInteractiveImport(store, rl, parsed);
-        } else if (choice === "4") {
-          const existing = await store.get(await rl.question("Product ID or prefix: "));
-          const name = await rl.question(`Name [${existing.name}]: `);
-          const group = await rl.question(`Group [${existing.group || "-"}]: `);
-          const url = await rl.question(`URL [${existing.url}]: `);
-          const mode = await rl.question(`Mode [${modeLabel(existing.mode)}]: `);
-          const updated = await store.update(existing.id, {
-            name: name || existing.name,
-            group: group || existing.group,
-            url: url || existing.url,
-            mode: mode ? normalizeMode(mode) : existing.mode,
-          });
-          stdout.write(`Updated ${updated.id}.\n`);
-        } else if (choice === "5") {
-          const id = await rl.question("Product ID or prefix: ");
-          const armAction = (await rl.question("Type arm or disarm: ")).trim();
-          if (!/^(?:arm|enable|disarm|disable)$/i.test(armAction)) {
-            throw new Error('Enter "arm" or "disarm".');
-          }
-          const armed = /^(?:arm|enable)$/i.test(armAction);
-          const [updated] = await store.setArmed([id], armed);
-          stdout.write(`${updated.id} is now ${armed ? "armed" : "disarmed"}.\n`);
-        } else if (choice === "6") {
-          const id = await rl.question("Product ID or prefix: ");
-          const item = await store.get(id);
-          if (/^(?:y|yes)$/i.test(await rl.question(`Delete ${item.name}? [y/N]: `))) {
-            await store.remove(item.id);
-            stdout.write(`Deleted ${item.id}.\n`);
-          }
-        } else if (choice === "7") {
-          const answer = await rl.question(
-            "Execution mode override (observe/stop-before-submit/live; blank uses retailer settings): ",
-          );
-          await runEngine(store, answer || null, {
-            adapterOptions: await interactiveRunOptions(store, rl),
-            secretStore,
-          });
-        } else if (choice === "8") {
-          await interactiveSettings(store, secretStore, rl);
-        } else if (choice === "9") {
-          return;
-        } else {
-          stdout.write("Choose a number from 1 to 9.\n");
-        }
-      } catch (error) {
-        stderr.write(`Error: ${error.message}\n`);
-      }
-    }
-  } finally {
-    rl.close();
-  }
-}
-
 async function runCommand(store, secretStore, parsed) {
   const commandAliases = {
     enable: "arm",
@@ -814,7 +584,14 @@ async function runCommand(store, secretStore, parsed) {
   const { options, positionals } = parsed;
 
   if (!command) {
-    return interactiveMenu(store, secretStore);
+    const { launchDealsTui } = require("./src/deals-tui");
+    return launchDealsTui({
+      store,
+      secretStore,
+      runEngine,
+      input: stdin,
+      output: stdout,
+    });
   }
   if (command === "list") {
     printProducts(await store.list());
@@ -984,18 +761,12 @@ if (require.main === module) {
 
 module.exports = {
   challengeSolverOption,
-  collectPaste,
-  completeInteractiveImport,
   matchEventItems,
   parseCommandLine,
-  parseYesNo,
   printProducts,
   printSecrets,
   printSettings,
   prepareAdapterRun,
-  promptImportMode,
-  questionSecret,
-  interactiveRunOptions,
   retailerLabel,
   runAdapter,
   runCommand,
