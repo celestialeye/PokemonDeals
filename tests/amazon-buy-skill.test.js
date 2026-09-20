@@ -34,7 +34,7 @@ test("amazon-buy skill declares the guarded one-product purchase workflow", () =
   assert.doesNotMatch(skill, /offeringID=[A-Za-z0-9%+/=]+/);
 });
 
-test("amazon-buy runner uses the repository worker and documented CDP profile", () => {
+test("amazon-buy runner uses the repository worker and shared safe CDP bootstrap", () => {
   const runner = fs.readFileSync(runnerPath, "utf8");
   const workerPattern =
     /(?:^|[\s\\/"])(?:amazon-preorder|amazon-checkout|amazon-multi-preorder)\.js(?:["\s]|$)/i;
@@ -44,13 +44,11 @@ test("amazon-buy runner uses the repository worker and documented CDP profile", 
   assert.match(runner, /\$env:AMAZON_PRODUCT_URL = \$AmazonUrl/);
   assert.match(runner, /\$env:AMAZON_CHECKOUT_URL = \$AmazonUrl/);
   assert.match(runner, /parseAmazonBuyUrl/);
-  assert.match(runner, /127\.0\.0\.1:9444\/json\/version/);
-  assert.match(runner, /Google\\Chrome\\User Data/);
-  assert.match(runner, /--profile-directory=Default/);
-  assert.match(runner, /ProcessStartInfo/);
-  assert.match(runner, /ArgumentList\.Add/);
-  assert.match(runner, /CloseMainWindow/);
-  assert.match(runner, /Stop-Process -Id \$browserPid/);
+  assert.match(runner, /require\("\.\/src\/chrome-cdp"\)/);
+  assert.match(runner, /ensureChromeCdp/);
+  assert.doesNotMatch(runner, /Google\\Chrome\\User Data/);
+  assert.doesNotMatch(runner, /CloseMainWindow/);
+  assert.doesNotMatch(runner, /Stop-Process/);
   assert.match(runner, /Local\\PokemonDealsAmazonBuy/);
   assert.match(runner, /\$mutex\.WaitOne\(0\)/);
   assert.match(runner, /\$mutex\.ReleaseMutex\(\)/);

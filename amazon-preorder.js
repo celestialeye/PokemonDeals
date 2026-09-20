@@ -73,17 +73,162 @@ function parseOrderTotal(text) {
   return match ? Number(match[1].replace(/,/g, "")) : null;
 }
 
+function isAmazonCheckoutPageUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    return (
+      /(?:^|\.)amazon\.com$/i.test(url.hostname) &&
+      /^\/(?:checkout|gp\/buy)(?:[/?#]|$)/i.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function parseCheckoutQuantity(text) {
+  const normalizedText = text.replace(/\s+/g, " ");
+  const match =
+    normalizedText.match(/\b(?:qty|quantity)\s*:?\s*(\d+)\b/i) ||
+    normalizedText.match(/\bitems?\s*\(\s*(\d+)\s*\)\s*:/i);
+  return match ? Number(match[1]) : null;
+}
+
+function parseCheckoutLineItemPrice(text) {
+  const prices = [
+    ...text.replace(/\s+/g, " ").matchAll(/\$([\d,]+(?:\.\d{2})?)/g),
+  ].map((match) => Number(match[1].replace(/,/g, "")));
+  const uniquePrices = [...new Set(prices)];
+  return uniquePrices.length === 1 ? uniquePrices[0] : null;
+}
+
+function normalizeAsin(value) {
+  const asin = String(value || "").trim().toUpperCase();
+  return /^[A-Z0-9]{10}$/.test(asin) ? asin : null;
+}
+
+function selectExpectedCheckoutLineItem(
+  candidates,
+  {
+    expectedAsin: requiredAsin,
+    expectedTitle: requiredTitle = "",
+  } = {},
+) {
+  const lineItems = new Map();
+  for (const [index, candidate] of candidates.entries()) {
+    const text = String(candidate.text || "").replace(/\s+/g, " ").trim();
+    const asins = [
+      ...new Set(
+        (candidate.asins || [])
+          .map(normalizeAsin)
+          .filter(Boolean),
+      ),
+    ];
+    const key = candidate.id || `candidate-${index}`;
+    lineItems.set(key, {
+      asins,
+      text,
+    });
+  }
+
+  if (lineItems.size !== 1) {
+    return null;
+  }
+
+  const [lineItem] = lineItems.values();
+  if (!lineItem.text || lineItem.text.length > 2000) {
+    return null;
+  }
+
+  lineItem.quantity = parseCheckoutQuantity(lineItem.text);
+  lineItem.itemPrice = parseCheckoutLineItemPrice(lineItem.text);
+  if (lineItem.quantity === null || lineItem.itemPrice === null) {
+    return null;
+  }
+
+  const asinMatches =
+    lineItem.asins.length === 1 && lineItem.asins[0] === requiredAsin;
+  const titleMatches =
+    lineItem.asins.length === 0 &&
+    requiredTitle.length > 0 &&
+    lineItem.text.toLowerCase().includes(requiredTitle.toLowerCase());
+  return asinMatches || titleMatches ? lineItem : null;
+}
+
 function hasVerifiedDirectCheckoutIdentity({
   activeCheckoutUrl,
   activeOfferAsin,
   activeOfferListingId,
   expectedAsin: requiredAsin,
 }) {
-  return (
-    Boolean(activeCheckoutUrl) &&
-    Boolean(activeOfferListingId) &&
-    activeOfferAsin === requiredAsin
-  );
+  if (
+    !activeCheckoutUrl ||
+    !activeOfferListingId ||
+    activeOfferAsin !== requiredAsin
+  ) {
+    return false;
+  }
+
+  try {
+    const parsedCheckout = parseAmazonCheckoutUrl(activeCheckoutUrl);
+    return (
+      parsedCheckout.asin === requiredAsin &&
+      amazonOfferListingIdsMatch(
+        parsedCheckout.offerListingId,
+        activeOfferListingId,
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
+function validateAmazonCheckoutEvidence({
+  currentCheckoutPageVerified,
+  directCheckoutIdentityVerified,
+  lineItem,
+  bodyText,
+  maxItemPrice: itemPriceLimit,
+  maxOrderTotal: orderTotalLimit,
+}) {
+  if (
+    !currentCheckoutPageVerified ||
+    !directCheckoutIdentityVerified ||
+    !lineItem
+  ) {
+    return { ok: false, reason: "product-mismatch" };
+  }
+
+  const { itemPrice, quantity } = lineItem;
+  if (quantity !== 1) {
+    return { ok: false, reason: "quantity-not-one", quantity };
+  }
+
+  if (itemPrice > itemPriceLimit) {
+    return {
+      ok: false,
+      reason: "item-price-over-limit",
+      itemPrice,
+    };
+  }
+
+  const orderTotal = parseOrderTotal(bodyText);
+  if (orderTotal === null) {
+    return { ok: false, reason: "order-total-missing" };
+  }
+  if (orderTotal > orderTotalLimit) {
+    return {
+      ok: false,
+      reason: "order-total-over-limit",
+      orderTotal,
+    };
+  }
+
+  return {
+    ok: true,
+    itemPrice,
+    orderTotal,
+    quantity,
+  };
 }
 
 function resolveVerifiedCheckoutUrl({
@@ -93,15 +238,13 @@ function resolveVerifiedCheckoutUrl({
   suppliedUrl,
   suppliedListingId,
 }) {
-  const usesSuppliedUrl =
+  const suppliedOfferVerified =
     Boolean(suppliedUrl) &&
     amazonOfferListingIdsMatch(offerListingId, suppliedListingId);
 
   return {
-    url: usesSuppliedUrl
-      ? suppliedUrl
-      : buildDirectBuyUrl(asin, offerListingId, { tag }),
-    usesSuppliedUrl,
+    url: buildDirectBuyUrl(asin, offerListingId, { tag }),
+    suppliedOfferVerified,
   };
 }
 
@@ -146,18 +289,212 @@ async function getDirectOffer(page) {
   };
 }
 
-async function containsExpectedProduct(page, bodyText = "") {
-  if (
-    (await page
-      .locator(
-        `[data-asin="${expectedAsin}"], a[href*="/dp/${expectedAsin}"], input[value="${expectedAsin}"]`,
-      )
-      .count()) > 0
+async function readContainerAsins(container) {
+  const asins = new Set();
+  const addAsin = (value) => {
+    const asin = normalizeAsin(value);
+    if (asin) {
+      asins.add(asin);
+    }
+  };
+  const addHrefAsin = (href) => {
+    const match = String(href || "").match(
+      /\/(?:dp|gp\/product)\/([A-Z0-9]{10})(?:[/?#]|$)/i,
+    );
+    addAsin(match?.[1]);
+  };
+
+  addAsin(await container.getAttribute("data-asin").catch(() => null));
+  addAsin(await container.inputValue().catch(() => null));
+  addHrefAsin(await container.getAttribute("href").catch(() => null));
+
+  const dataAsins = container.locator("[data-asin]");
+  for (
+    let index = 0;
+    index < Math.min(await dataAsins.count(), 20);
+    index += 1
   ) {
-    return true;
+    addAsin(
+      await dataAsins.nth(index).getAttribute("data-asin").catch(() => null),
+    );
   }
 
-  return expectedTitle.length > 0 && bodyText.includes(expectedTitle);
+  const asinInputs = container.locator(
+    'input[name*="asin"], input[name*="ASIN"]',
+  );
+  for (
+    let index = 0;
+    index < Math.min(await asinInputs.count(), 20);
+    index += 1
+  ) {
+    addAsin(await asinInputs.nth(index).inputValue().catch(() => null));
+  }
+
+  const productLinks = container.locator(
+    'a[href*="/dp/"], a[href*="/gp/product/"]',
+  );
+  for (
+    let index = 0;
+    index < Math.min(await productLinks.count(), 20);
+    index += 1
+  ) {
+    addHrefAsin(
+      await productLinks.nth(index).getAttribute("href").catch(() => null),
+    );
+  }
+
+  return [...asins];
+}
+
+async function readElementText(container) {
+  return container
+    .evaluate((element) => {
+      const parts = [];
+      const nodeFilter = element.ownerDocument.defaultView.NodeFilter;
+      const walker = element.ownerDocument.createTreeWalker(
+        element,
+        nodeFilter.SHOW_TEXT,
+      );
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        let current = node.parentElement;
+        let hidden = false;
+        while (current) {
+          const style = element.ownerDocument.defaultView.getComputedStyle(
+            current,
+          );
+          if (
+            current.hidden ||
+            current.getAttribute("aria-hidden") === "true" ||
+            style.display === "none" ||
+            style.visibility === "hidden" ||
+            style.visibility === "collapse" ||
+            style.opacity === "0"
+          ) {
+            hidden = true;
+            break;
+          }
+          current = current.parentElement;
+        }
+        if (hidden) {
+          continue;
+        }
+        const range = element.ownerDocument.createRange();
+        range.selectNodeContents(node);
+        const rendered = [...range.getClientRects()].some(
+          (rect) => rect.width > 0 && rect.height > 0,
+        );
+        range.detach();
+        if (!rendered) {
+          continue;
+        }
+        const value = node.nodeValue.replace(/\s+/g, " ").trim();
+        if (value) {
+          parts.push(value);
+        }
+      }
+      return parts.join(" ");
+    })
+    .catch(() => "");
+}
+
+async function collectCheckoutLineItemCandidates(identityNodes) {
+  const candidates = [];
+  for (
+    let index = 0;
+    index < Math.min(await identityNodes.count(), 50);
+    index += 1
+  ) {
+    let container = identityNodes.nth(index);
+    let fallbackCandidate = null;
+    for (let depth = 0; depth < 8; depth += 1) {
+      if (await container.isVisible().catch(() => false)) {
+        const text = await readElementText(container);
+        if (text.length > 2000) {
+          break;
+        }
+        const dataAsin = normalizeAsin(
+          await container.getAttribute("data-asin").catch(() => null),
+        );
+        const testId = await container
+          .getAttribute("data-testid")
+          .catch(() => "");
+        const className = await container
+          .getAttribute("class")
+          .catch(() => "");
+        const tagName = await container
+          .evaluate((element) => element.tagName)
+          .catch(() => "");
+        const isLikelyItemContainer =
+          Boolean(dataAsin && text) ||
+          /(?:checkout|line|order|cart|sc-list)[-_ ]?item/i.test(
+            `${testId} ${className}`,
+          ) ||
+          /^(?:LI|TR)$/.test(tagName);
+        const candidate = {
+          asins: await readContainerAsins(container),
+          id: await container
+            .evaluate((element) => {
+              const path = [];
+              for (
+                let current = element;
+                current?.parentElement;
+                current = current.parentElement
+              ) {
+                path.push(
+                  [...current.parentElement.children].indexOf(current),
+                );
+              }
+              return path.reverse().join(".");
+            })
+            .catch(() => null),
+          text,
+        };
+        if (isLikelyItemContainer && !fallbackCandidate) {
+          fallbackCandidate = candidate;
+        }
+        if (
+          parseCheckoutQuantity(text) !== null &&
+          parseCheckoutLineItemPrice(text) !== null
+        ) {
+          candidates.push(candidate);
+          fallbackCandidate = null;
+          break;
+        }
+      }
+      container = container.locator("..");
+    }
+    if (fallbackCandidate) {
+      candidates.push(fallbackCandidate);
+    }
+  }
+  return candidates;
+}
+
+async function readExpectedCheckoutLineItem(page, placeOrder) {
+  const checkoutForm = placeOrder.locator("xpath=ancestor::form[1]");
+  let scope = checkoutForm;
+  if ((await checkoutForm.count()) === 0) {
+    const main = page.getByRole("main").first();
+    scope = (await main.count()) > 0 ? main : page.locator("body");
+  }
+
+  const candidates = await collectCheckoutLineItemCandidates(
+    scope.locator(
+      '[data-asin], input[name*="asin"], input[name*="ASIN"], a[href*="/dp/"], a[href*="/gp/product/"]',
+    ),
+  );
+  if (expectedTitle) {
+    candidates.push(
+      ...(await collectCheckoutLineItemCandidates(
+        scope.getByText(expectedTitle, { exact: true }),
+      )),
+    );
+  }
+
+  return selectExpectedCheckoutLineItem(candidates, {
+    expectedAsin,
+    expectedTitle,
+  });
 }
 
 async function findAmazonBuyingOption(page) {
@@ -404,8 +741,7 @@ async function main() {
         }
 
         const outOfStockCheckout = /\/checkout\/entry\/oos/i.test(page.url());
-        const onCheckoutPage =
-          /amazon\.com\/checkout/i.test(page.url()) || outOfStockCheckout;
+        const onCheckoutPage = isAmazonCheckoutPageUrl(page.url());
         const unavailable =
           outOfStockCheckout ||
           (onCheckoutPage && isUnavailableCheckoutText(bodyText));
@@ -434,23 +770,33 @@ async function main() {
               .catch(() => {});
 
             const refreshedOffer = await findAmazonDirectBuyOffer(page);
-            if (refreshedOffer) {
-              const refreshedCheckout = resolveVerifiedCheckoutUrl({
-                asin: expectedAsin,
-                offerListingId: refreshedOffer.offerListingId,
-                tag: associateTag,
-                suppliedUrl: suppliedCheckoutUrl,
-                suppliedListingId: suppliedOfferListingId,
-              });
-              if (refreshedOffer.offerListingId !== activeOfferListingId) {
-                console.log(
-                  `AMAZON_OFFER_TOKEN_REFRESHED - ${refreshedOffer.source} Amazon at $${refreshedOffer.price.toFixed(2)}`,
-                );
-                activeOfferAsin = refreshedOffer.asin;
-                activeOfferListingId = refreshedOffer.offerListingId;
-                activeCheckoutUrl = refreshedCheckout.url;
-                checkoutRefreshes = 0;
-              }
+            if (!refreshedOffer) {
+              console.log(
+                "AMAZON_OFFER_REVALIDATION_FAILED - current qualifying Amazon offer unavailable",
+              );
+              activeOfferAsin = null;
+              activeOfferListingId = null;
+              activeCheckoutUrl = null;
+              checkoutRefreshes = 0;
+              await page.waitForTimeout(retryDelayMs);
+              continue;
+            }
+
+            const refreshedCheckout = resolveVerifiedCheckoutUrl({
+              asin: expectedAsin,
+              offerListingId: refreshedOffer.offerListingId,
+              tag: associateTag,
+              suppliedUrl: suppliedCheckoutUrl,
+              suppliedListingId: suppliedOfferListingId,
+            });
+            activeOfferAsin = refreshedOffer.asin;
+            if (refreshedOffer.offerListingId !== activeOfferListingId) {
+              console.log(
+                `AMAZON_OFFER_TOKEN_REFRESHED - ${refreshedOffer.source} Amazon at $${refreshedOffer.price.toFixed(2)}`,
+              );
+              activeOfferListingId = refreshedOffer.offerListingId;
+              activeCheckoutUrl = refreshedCheckout.url;
+              checkoutRefreshes = 0;
             }
           }
 
@@ -468,39 +814,53 @@ async function main() {
           .getByRole("button", { name: /place (?:your )?order/i })
           .first();
         if (await isReady(placeOrder)) {
-          const productIdentityVerified =
-            (await containsExpectedProduct(page, bodyText)) ||
-            hasVerifiedDirectCheckoutIdentity({
-              activeCheckoutUrl,
-              activeOfferAsin,
-              activeOfferListingId,
-              expectedAsin,
-            });
-          if (!productIdentityVerified) {
-            console.log(
-              "AMAZON_CHECKOUT_PRODUCT_MISMATCH - refusing to place order",
-            );
-            await page
-              .goto(productUrl, {
-                waitUntil: "domcontentloaded",
-                timeout: 15000,
-              })
-              .catch(() => {});
-            continue;
-          }
-
-          const orderTotal = parseOrderTotal(bodyText);
-          if (orderTotal === null) {
-            console.log("AMAZON_ORDER_BLOCKED - order total not detected");
-            await page.waitForTimeout(1000);
-            continue;
-          }
-          if (orderTotal > maxOrderTotal) {
-            console.error(
-              `AMAZON_ORDER_BLOCKED - total $${orderTotal.toFixed(2)} exceeds limit $${maxOrderTotal.toFixed(2)}`,
-            );
+          const checkoutValidation = validateAmazonCheckoutEvidence({
+            currentCheckoutPageVerified: onCheckoutPage,
+            directCheckoutIdentityVerified:
+              hasVerifiedDirectCheckoutIdentity({
+                activeCheckoutUrl,
+                activeOfferAsin,
+                activeOfferListingId,
+                expectedAsin,
+              }),
+            lineItem: await readExpectedCheckoutLineItem(
+              page,
+              placeOrder,
+            ),
+            bodyText,
+            maxItemPrice,
+            maxOrderTotal,
+          });
+          if (!checkoutValidation.ok) {
+            if (checkoutValidation.reason === "item-price-over-limit") {
+              console.error(
+                `AMAZON_ORDER_BLOCKED - item price $${checkoutValidation.itemPrice.toFixed(2)} exceeds limit $${maxItemPrice.toFixed(2)}`,
+              );
+            } else if (
+              checkoutValidation.reason === "order-total-over-limit"
+            ) {
+              console.error(
+                `AMAZON_ORDER_BLOCKED - total $${checkoutValidation.orderTotal.toFixed(2)} exceeds limit $${maxOrderTotal.toFixed(2)}`,
+              );
+            } else {
+              const reasonMessages = {
+                "product-mismatch":
+                  "current checkout does not prove the expected product",
+                "quantity-not-one":
+                  "current checkout quantity is not exactly one",
+                "order-total-missing":
+                  "current checkout order total was not detected",
+              };
+              console.error(
+                `AMAZON_ORDER_BLOCKED - ${reasonMessages[checkoutValidation.reason]}`,
+              );
+            }
             process.exit(1);
           }
+
+          console.log(
+            `AMAZON_ORDER_GUARDS_VALIDATED itemPrice=$${checkoutValidation.itemPrice.toFixed(2)} orderTotal=$${checkoutValidation.orderTotal.toFixed(2)} quantity=1`,
+          );
 
           console.log(`AMAZON_PLACE_ORDER_FOUND after ${attempts} attempts`);
           submissionAttempted = true;
@@ -551,7 +911,7 @@ async function main() {
           checkoutRefreshes = 0;
           if (suppliedCheckoutUrl && !suppliedCheckoutDispositionLogged) {
             console.log(
-              resolvedCheckout.usesSuppliedUrl
+              resolvedCheckout.suppliedOfferVerified
                 ? "AMAZON_SUPPLIED_CHECKOUT_VERIFIED"
                 : "AMAZON_SUPPLIED_CHECKOUT_REPLACED - using current qualifying Amazon offer",
             );
@@ -610,9 +970,18 @@ if (require.main === module) {
 }
 
 module.exports = {
+  collectCheckoutLineItemCandidates,
   findAmazonDirectBuyOffer,
   getDirectOffer,
   hasVerifiedDirectCheckoutIdentity,
+  isAmazonCheckoutPageUrl,
+  parseCheckoutLineItemPrice,
+  parseCheckoutQuantity,
+  parseOrderTotal,
+  readElementText,
+  readExpectedCheckoutLineItem,
   readFirstInputValue,
   resolveVerifiedCheckoutUrl,
+  selectExpectedCheckoutLineItem,
+  validateAmazonCheckoutEvidence,
 };
