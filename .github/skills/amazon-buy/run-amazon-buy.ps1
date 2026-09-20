@@ -1,0 +1,237 @@
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory = $true, Position = 0)]
+  [ValidateNotNullOrEmpty()]
+  [string]$ProductUrl,
+
+  [ValidateRange(0.01, 10000)]
+  [decimal]$MaxItemPrice = 10000,
+
+  [ValidateRange(0.01, 10000)]
+  [decimal]$MaxOrderTotal = 10000
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
+$logDirectory = Join-Path $repoRoot "logs"
+$runTimestamp = Get-Date -Format "yyyyMMdd-HHmmssfff"
+$env:AMAZON_RUN_LOG_PATH = Join-Path (
+  New-Item -ItemType Directory -Path $logDirectory -Force
+).FullName "amazon-buy-$runTimestamp-$PID.jsonl"
+$mutex = [System.Threading.Mutex]::new(
+  $false,
+  "Local\PokemonDealsAmazonBuy"
+)
+$mutexHeld = $false
+Push-Location $repoRoot
+
+function Protect-AmazonLogText {
+  param([AllowNull()][object]$Value)
+
+  return ([string]$Value) `
+    -replace '(?i)(https://(?:www\.)?amazon\.com/(?:checkout|gp/buy)(?:/[^\s"''<>?]*)?)\?[^\s"''<>]*', '$1?<redacted>' `
+    -replace '(?i)("(?:offeringID|offerListingID|AMAZON_CHECKOUT_URL|authorization|proxy-authorization|cookie|set-cookie|session-token|x-amz-security-token)"\s*:\s*)"(?:\\.|[^"\\])*"', '$1"<redacted>"' `
+    -replace '(?i)((?:offeringID|offerListingID|AMAZON_CHECKOUT_URL)"?\s*[=:]\s*)"?[^&\s"''<>]*', '$1<redacted>' `
+    -replace '(?i)((?:authorization|proxy-authorization|cookie|set-cookie|session-token|x-amz-security-token)\s*[=:]\s*)[^\r\n]*', '$1<redacted>' `
+    -replace '\b\d{3}-\d{7}-\d{7}\b', '<redacted-order-id>'
+}
+
+function Write-AmazonRunEvent {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Level,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Event,
+
+    [hashtable]$Data = @{}
+  )
+
+  $record = [ordered]@{
+    timestamp = [DateTimeOffset]::UtcNow.ToString("o")
+    workflow = "amazon-buy-launcher"
+    pid = $PID
+    level = $Level
+    event = $Event
+    message = $Event
+  }
+  foreach ($key in $Data.Keys) {
+    $record[$key] = Protect-AmazonLogText $Data[$key]
+  }
+  $record |
+    ConvertTo-Json -Compress |
+    Add-Content -LiteralPath $env:AMAZON_RUN_LOG_PATH -Encoding utf8
+}
+
+try {
+  Write-AmazonRunEvent -Level "info" -Event "AMAZON_LAUNCHER_STARTED"
+  Write-Host "AMAZON_LOG_FILE $([System.Uri]::new($env:AMAZON_RUN_LOG_PATH).AbsoluteUri)"
+
+  try {
+    $mutexHeld = $mutex.WaitOne(0)
+  } catch [System.Threading.AbandonedMutexException] {
+    $mutexHeld = $true
+  }
+  if (-not $mutexHeld) {
+    throw "Another amazon-buy invocation is already active."
+  }
+  Write-AmazonRunEvent -Level "info" -Event "AMAZON_LAUNCHER_LOCK_ACQUIRED"
+
+  $env:AMAZON_PRODUCT_URL = $ProductUrl
+  $env:AMAZON_MAX_ITEM_PRICE = $MaxItemPrice.ToString(
+    [System.Globalization.CultureInfo]::InvariantCulture
+  )
+  $env:AMAZON_MAX_ORDER_TOTAL = $MaxOrderTotal.ToString(
+    [System.Globalization.CultureInfo]::InvariantCulture
+  )
+  Remove-Item Env:AMAZON_EXPECTED_ASIN -ErrorAction SilentlyContinue
+  Remove-Item Env:AMAZON_EXPECTED_TITLE -ErrorAction SilentlyContinue
+
+  $productAsin = & node -e 'const { parseAmazonProductUrl } = require("./src/amazon-offers"); const product = parseAmazonProductUrl(process.env.AMAZON_PRODUCT_URL); process.stdout.write(product.asin);'
+  if ($LASTEXITCODE -ne 0) {
+    throw "Amazon product URL validation failed."
+  }
+  Write-AmazonRunEvent `
+    -Level "info" `
+    -Event "AMAZON_PRODUCT_ACCEPTED" `
+    -Data @{ asin = $productAsin; quantity = 1 }
+  Write-Host "AMAZON_PRODUCT_ACCEPTED asin=$productAsin"
+
+  & node -e 'require.resolve("playwright-core")' *> $null
+  if ($LASTEXITCODE -ne 0) {
+    npm install --no-audit --no-fund
+    if ($LASTEXITCODE -ne 0) {
+      throw "npm install failed."
+    }
+  }
+  Write-AmazonRunEvent -Level "info" -Event "AMAZON_DEPENDENCIES_READY"
+
+  $workerPattern =
+    '(?i)(?:^|[\s\\/"])(?:amazon-preorder|amazon-checkout|amazon-multi-preorder)\.js(?:["\s]|$)'
+  $workers = @(
+    Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
+      Where-Object { $_.CommandLine -match $workerPattern }
+  )
+  if ($workers.Count -gt 0) {
+    $workerPids = ($workers | Select-Object -ExpandProperty ProcessId) -join ","
+    throw "A competing Amazon purchase worker is already running (PID(s): $workerPids). Stop it before starting amazon-buy."
+  }
+  Write-AmazonRunEvent -Level "info" -Event "AMAZON_WORKER_PREFLIGHT_READY"
+
+  function Test-ChromeCdp {
+    try {
+      Invoke-RestMethod `
+        -Uri "http://127.0.0.1:9444/json/version" `
+        -TimeoutSec 2 `
+        -ErrorAction Stop |
+        Out-Null
+      return $true
+    } catch {
+      return $false
+    }
+  }
+
+  if (Test-ChromeCdp) {
+    Write-AmazonRunEvent -Level "info" -Event "AMAZON_CDP_REUSED"
+  } else {
+    Write-AmazonRunEvent -Level "info" -Event "AMAZON_CDP_RESTARTING"
+    $browserProcesses = @(
+      Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'"
+    )
+    foreach ($browser in $browserProcesses) {
+      $process = Get-Process -Id $browser.ProcessId -ErrorAction SilentlyContinue
+      if ($process -and $process.MainWindowHandle -ne 0) {
+        $null = $process.CloseMainWindow()
+      }
+    }
+
+    $deadline = (Get-Date).AddSeconds(12)
+    do {
+      Start-Sleep -Milliseconds 500
+      $remainingBrowsers = @(
+        Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'"
+      )
+    } while (
+      $remainingBrowsers.Count -gt 0 -and
+      (Get-Date) -lt $deadline
+    )
+
+    foreach ($browserPid in @(
+      $remainingBrowsers | Select-Object -ExpandProperty ProcessId
+    )) {
+      Stop-Process -Id $browserPid -Force -ErrorAction SilentlyContinue
+    }
+
+    $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+    if (-not (Test-Path $chrome)) {
+      throw "Google Chrome was not found at the documented path."
+    }
+
+    $userData = "$env:LOCALAPPDATA\Google\Chrome\User Data"
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $chrome
+    $startInfo.UseShellExecute = $true
+    foreach ($argument in @(
+      "--user-data-dir=$userData",
+      "--profile-directory=Default",
+      "--remote-debugging-port=9444",
+      "--remote-allow-origins=*",
+      "--restore-last-session"
+    )) {
+      $null = $startInfo.ArgumentList.Add($argument)
+    }
+    $null = [System.Diagnostics.Process]::Start($startInfo)
+
+    $cdpReady = $false
+    for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+      Start-Sleep -Milliseconds 500
+      if (Test-ChromeCdp) {
+        $cdpReady = $true
+        break
+      }
+    }
+    if (-not $cdpReady) {
+      throw "Chrome started, but CDP did not become available on port 9444."
+    }
+    Write-AmazonRunEvent -Level "info" -Event "AMAZON_CDP_READY"
+  }
+
+  Write-AmazonRunEvent `
+    -Level "info" `
+    -Event "AMAZON_WORKER_STARTING" `
+    -Data @{
+      asin = $productAsin
+      maxItemPrice = $env:AMAZON_MAX_ITEM_PRICE
+      maxOrderTotal = $env:AMAZON_MAX_ORDER_TOTAL
+      quantity = 1
+    }
+  Write-Host (
+    "AMAZON_BUY_STARTED maxItemPrice={0} maxOrderTotal={1}" -f
+      $env:AMAZON_MAX_ITEM_PRICE,
+      $env:AMAZON_MAX_ORDER_TOTAL
+  )
+  npm run amazon:direct-buy
+  $workerExitCode = $LASTEXITCODE
+  Write-AmazonRunEvent `
+    -Level $(if ($workerExitCode -eq 0) { "info" } else { "error" }) `
+    -Event "AMAZON_WORKER_EXIT" `
+    -Data @{ exitCode = $workerExitCode }
+  if ($workerExitCode -ne 0) {
+    throw "Amazon direct-buy worker exited with code $workerExitCode."
+  }
+  Write-AmazonRunEvent -Level "info" -Event "AMAZON_LAUNCHER_COMPLETED"
+} catch {
+  Write-AmazonRunEvent `
+    -Level "error" `
+    -Event "AMAZON_LAUNCHER_FAILED" `
+    -Data @{ error = $_.Exception.Message }
+  throw
+} finally {
+  if ($mutexHeld) {
+    $mutex.ReleaseMutex()
+  }
+  $mutex.Dispose()
+  Pop-Location
+}

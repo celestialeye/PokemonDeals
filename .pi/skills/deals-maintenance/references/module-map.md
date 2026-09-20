@@ -11,7 +11,7 @@ All paths below are relative to the repository root. Use this map to locate code
 | Target catalogs and discovery | `target-products.js`, `target-preorder-discovery.js` | `tests/target-products.test.js`, `tests/target-preorder-discovery.test.js`; executing discovery itself is live, not a unit test |
 | Legacy Target monitor/checkout | `preorder.js`, `monitor.js` | `README.md`, `SESSION-LEARNINGS.md`; no dedicated checkout unit suite at harness creation |
 | Pokemon Center | `pokemoncenter-products.js`, `pokemoncenter-preorder.js` | `tests/pokemoncenter-products.test.js`; catalog coverage only, not checkout verification |
-| Amazon offers and shared cart | `src/amazon-offers.js`, `src/amazon-cart.js`, `amazon-preorder.js`, `amazon-multi-preorder.js` | `tests/amazon-offers.test.js`, `tests/amazon-multi-preorder.test.js`; includes direct Node assertions |
+| Amazon offers, direct buy, shared cart, and logging | `src/amazon-offers.js`, `src/amazon-cart.js`, `src/amazon-run-log.js`, `amazon-preorder.js`, `amazon-multi-preorder.js` | `tests/amazon-offers.test.js`, `tests/amazon-direct-buy.test.js`, `tests/amazon-run-log.test.js`, `tests/amazon-multi-preorder.test.js`; includes direct Node assertions |
 | Amazon transient checkout | `amazon-checkout.js` | `README.md`, `SESSION-LEARNINGS.md`; no dedicated checkout unit suite at harness creation |
 | Experimental variant | `monitor_with_captcha_simulation.js` | Syntax-only; not an exposed operational workflow |
 
