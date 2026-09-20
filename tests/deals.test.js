@@ -19,6 +19,7 @@ const {
   normalizeExecutionMode,
   parseTargetOutput,
   productMetadata,
+  resolveProductMetadata,
   targetWorkerMode,
   validateTargetEnvironment,
   validateTargetSettingsForRun,
@@ -46,6 +47,7 @@ const {
   maximumTimerMs,
   normalizeTargetSettings,
   setTargetSetting,
+  targetSettingOptions,
   targetSettingsDefaults,
 } = require("../src/target-deal-settings");
 
@@ -123,6 +125,15 @@ Future item: example.com/products/future
     parseGroupedList("not a product line").errors[0],
     /expected "Name: URL"/i,
   );
+  assert.deepEqual(
+    parseGroupedList("https://www.target.com/p/-/A-1010892069").items[0],
+    {
+      name: "",
+      group: "",
+      url: "https://www.target.com/p/-/A-1010892069",
+      sourceLine: 1,
+    },
+  );
 });
 
 test("URL normalization, retailer detection, and mode mapping are explicit", () => {
@@ -133,6 +144,8 @@ test("URL normalization, retailer detection, and mode mapping are explicit", () 
   assert.deepEqual(productMetadata("target.com/p/example/-/A-1010892067"), {
     retailer: "target",
     normalizedUrl: "https://www.target.com/p/example/-/A-1010892067",
+    name: "Poster Collection",
+    nameSource: "known",
     resolvedProductId: "A-1010892067",
     resolvedUrl: "https://www.target.com/p/example/-/A-1010892067",
   });
@@ -142,6 +155,7 @@ test("URL normalization, retailer detection, and mode mapping are explicit", () 
     ).retailer,
     "unsupported",
   );
+  assert.equal(productMetadata("https://example.com/future-item").name, "Future Item");
   assert.equal(productMetadata("https://example.com/item").retailer, "unsupported");
   assert.equal(normalizeMode("Buy Now"), "buy-now");
   assert.equal(normalizeMode("Preorder"), "preorder");
@@ -153,8 +167,55 @@ test("URL normalization, retailer detection, and mode mapping are explicit", () 
   assert.throws(() => normalizeMode("automatic"), /Buy Now, Preorder, or Buy/);
 });
 
+test("product metadata retrieves a page title and follows redirects", async () => {
+  const resolved = await resolveProductMetadata(
+    "https://howl.link/future-box",
+    {
+      fetchImpl: async () => ({
+        url: "https://www.target.com/p/pokemon-tcg-future-box/-/A-1099999999",
+        text: async () =>
+          '<meta property="og:title" content="Pokémon TCG: Future Box | Target">',
+      }),
+    },
+  );
+  assert.equal(resolved.name, "Pokémon TCG: Future Box");
+  assert.equal(resolved.nameSource, "page");
+  assert.equal(resolved.resolvedProductId, "A-1099999999");
+});
+
+test("catalog persistence resolves a missing product name before saving", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pokemon-deals-name-"));
+  const filePath = path.join(directory, "deals.json");
+  const store = createCatalogStore(filePath, {
+    resolveMetadata: async (url) => ({
+      ...productMetadata(url),
+      name: "Retrieved Product",
+      nameSource: "page",
+    }),
+  });
+  try {
+    const item = await store.add({
+      url: "https://www.target.com/p/future-box/-/A-1099999999",
+      mode: "buy",
+      armed: true,
+    });
+    assert.equal(item.name, "Retrieved Product");
+    assert.equal((await store.list())[0].name, "Retrieved Product");
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Target settings expose validated current defaults and relationships", () => {
   assert.deepEqual(normalizeTargetSettings(), targetSettingsDefaults);
+  assert.deepEqual(
+    targetSettingOptions("defaultRunMode").map(({ value }) => value),
+    ["observe", "stop-before-submit", "live"],
+  );
+  assert.match(
+    targetSettingOptions("defaultRunMode")[1].description,
+    /cart and checkout/i,
+  );
   assert.equal(
     setTargetSetting(targetSettingsDefaults, "default-run-mode", "observe")
       .defaultRunMode,
@@ -180,12 +241,8 @@ test("Target settings expose validated current defaults and relationships", () =
     new RegExp(`1500-${maximumPollIntervalMs}`),
   );
   assert.throws(
-    () => setTargetSetting(targetSettingsDefaults, "hold-ms", "15001"),
-    /100-15000/i,
-  );
-  assert.throws(
-    () => setTargetSetting(targetSettingsDefaults, "timeout-ms", "10000"),
-    /hold-ms plus 1000/i,
+    () => setTargetSetting(targetSettingsDefaults, "timeout-ms", "999"),
+    /1000-45000/i,
   );
   assert.throws(
     () =>
@@ -378,13 +435,13 @@ test("catalog CRUD is atomic, rejects duplicates, and resolves unique prefixes",
   });
   try {
     const first = await store.add({
-      name: "Elite Trainer Box",
       group: "30th Celebration",
       url: "howl.link/99668grkawccg",
       mode: "preorder",
       armed: false,
     });
     assert.equal(first.id, "alpha0000001");
+    assert.equal(first.name, "Elite Trainer Box");
     assert.equal(first.resolvedProductId, "A-1010892076");
     assert.equal(resolveUniquePrefix(await store.list(), "alpha").id, first.id);
 
@@ -438,6 +495,35 @@ test("catalog CRUD is atomic, rejects duplicates, and resolves unique prefixes",
     );
     const directoryFiles = await fs.readdir(path.dirname(filePath));
     assert.deepEqual(directoryFiles, ["deals.json"]);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("confirmed products remain excluded until explicitly re-armed", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pokemon-deals-"));
+  const filePath = path.join(directory, "deals.json");
+  const store = createCatalogStore(filePath, {
+    idFactory: () => "confirmed0001",
+  });
+  try {
+    const added = await store.add({
+      name: "Confirmed Product",
+      url: "https://www.target.com/p/-/A-1010892067",
+      mode: "buy",
+      armed: true,
+    });
+    await store.updateRuntime([added.id], {
+      lastStatus: "Order confirmed",
+      terminalOutcome: "confirmed",
+    });
+
+    const edited = await store.update(added.id, { name: "Edited Product" });
+    assert.equal(edited.terminalOutcome, "confirmed");
+
+    const rearmed = await store.setArmed([added.id], true);
+    assert.equal(rearmed[0].terminalOutcome, null);
+    assert.equal(rearmed[0].lastStatus, "Not run");
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
@@ -793,7 +879,7 @@ test("Target run arguments and environment cover every execution mode", () => {
   ]);
   assert.deepEqual(
     validateTargetSettingsForRun("live-purchase", targetSettingsDefaults),
-    ["target.max-item-price", "target.max-order-total"],
+    [],
   );
   assert.deepEqual(
     validateTargetSettingsForRun("live-purchase", {
@@ -899,6 +985,15 @@ test("Target output parser maps product, resolution, status, and terminal events
   );
   assert.deepEqual(
     parseTargetOutput(
+      "TARGET_CHALLENGE_PAGE_CLEARED product=A-1000000001",
+    ),
+    {
+      productId: "A-1000000001",
+      status: "Verification cleared",
+    },
+  );
+  assert.deepEqual(
+    parseTargetOutput(
       "TARGET_CHALLENGE_BACKOFF 300000ms availability challenge 403 for A-1000000001",
     ),
     {
@@ -912,6 +1007,15 @@ test("Target output parser maps product, resolution, status, and terminal events
     {
       scope: "all",
       status: "Verification backoff",
+      important: true,
+    },
+  );
+  assert.deepEqual(
+    parseTargetOutput("TARGET_MONITOR_PAUSED 2984894ms"),
+    {
+      scope: "all",
+      status: "Verification backoff",
+      backoffMs: 2984894,
       important: true,
     },
   );

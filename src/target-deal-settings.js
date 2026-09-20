@@ -8,7 +8,6 @@ const targetSettingsDefaults = Object.freeze({
   solverEnabled: true,
   solveAttempts: 3,
   settleMs: 1500,
-  holdMs: 10000,
   timeoutMs: 20000,
   challengeBackoffMs: 300000,
   challengeMaxBackoffMs: 1800000,
@@ -29,8 +28,7 @@ const targetSettingDefinitions = Object.freeze([
   ["solver-enabled", "solverEnabled", "Challenge solver enabled"],
   ["solve-attempts", "solveAttempts", "Challenge solve attempts"],
   ["settle-ms", "settleMs", "Challenge settle (ms)"],
-  ["hold-ms", "holdMs", "Challenge hold (ms)"],
-  ["timeout-ms", "timeoutMs", "Challenge timeout (ms)"],
+  ["timeout-ms", "timeoutMs", "Challenge attempt timeout (ms)"],
   ["challenge-backoff-ms", "challengeBackoffMs", "Challenge backoff (ms)"],
   [
     "challenge-max-backoff-ms",
@@ -45,6 +43,77 @@ const targetSettingDefinitions = Object.freeze([
   ["max-polls", "maxPolls", "Maximum API polls (0 = unlimited)"],
   ["max-runtime-ms", "maxRuntimeMs", "Maximum runtime (ms, 0 = unlimited)"],
 ]);
+
+const targetSettingOptionDefinitions = Object.freeze({
+  defaultRunMode: Object.freeze([
+    {
+      value: "observe",
+      label: "Observe",
+      description: "Monitor availability only; send no purchase input.",
+    },
+    {
+      value: "stop-before-submit",
+      label: "Stop before submit",
+      description: "Prepare cart and checkout, but never place the order.",
+    },
+    {
+      value: "live",
+      label: "Live purchase",
+      description: "May place a real order when the engine auto-starts.",
+    },
+  ]),
+  expectedFulfillment: Object.freeze([
+    {
+      value: null,
+      label: "Any fulfillment",
+      description: "Accept whichever fulfillment Target reports.",
+    },
+    {
+      value: "shipping",
+      label: "Shipping",
+      description: "Require the item to be fulfilled by shipping.",
+    },
+    {
+      value: "delivery",
+      label: "Delivery",
+      description: "Require the item to be fulfilled by delivery.",
+    },
+    {
+      value: "pickup",
+      label: "Pickup",
+      description: "Require the item to be fulfilled by pickup.",
+    },
+    {
+      value: "drive-up",
+      label: "Drive Up",
+      description: "Require the item to be fulfilled by Drive Up.",
+    },
+  ]),
+  browserDriver: Object.freeze([
+    {
+      value: "patchright",
+      label: "Patchright",
+      description: "Use the default Patchright browser driver.",
+    },
+    {
+      value: "playwright",
+      label: "Playwright",
+      description: "Use the Playwright fallback browser driver.",
+    },
+  ]),
+  solverEnabled: Object.freeze([
+    {
+      value: true,
+      label: "Enabled",
+      description: "Attempt supported Target Press & Hold recovery.",
+    },
+    {
+      value: false,
+      label: "Disabled",
+      description: "Pause on verification and require manual handling.",
+    },
+  ]),
+});
 
 const settingNames = new Map();
 for (const [cliName, property] of targetSettingDefinitions) {
@@ -192,7 +261,6 @@ function parseTargetSetting(property, value) {
     ],
     solveAttempts: ["Solve attempts", 1, Infinity],
     settleMs: ["Settle interval", 500, maximumTimerMs],
-    holdMs: ["Hold interval", 100, 15000],
     timeoutMs: ["Challenge timeout", 1000, 45000],
     challengeBackoffMs: ["Challenge backoff", 60000, maximumTimerMs],
     challengeMaxBackoffMs: [
@@ -213,11 +281,6 @@ function parseTargetSetting(property, value) {
 }
 
 function validateRelationships(settings) {
-  if (settings.timeoutMs < settings.holdMs + 1000) {
-    throw new Error(
-      "Challenge timeout must be at least hold-ms plus 1000.",
-    );
-  }
   if (settings.challengeMaxBackoffMs < settings.challengeBackoffMs) {
     throw new Error(
       "Maximum challenge backoff must be at least challenge-backoff-ms.",
@@ -259,6 +322,15 @@ function targetSettingRows(settings) {
   }));
 }
 
+function targetSettingOptions(property) {
+  const definition = targetSettingDefinitions.find(([key, name]) =>
+    key === property || name === property);
+  const normalizedProperty = definition?.[1] || property;
+  return (targetSettingOptionDefinitions[normalizedProperty] || []).map((option) => ({
+    ...option,
+  }));
+}
+
 function setEnvironmentValue(env, name, value) {
   if (value === null || value === undefined || value === "") {
     delete env[name];
@@ -284,7 +356,6 @@ function validateEffectiveChallengeSettings(env, settings) {
       "settleMs",
       env.TARGET_CHALLENGE_SETTLE_MS,
     ),
-    holdMs: parseTargetSetting("holdMs", env.TARGET_CHALLENGE_HOLD_MS),
     timeoutMs: parseTargetSetting(
       "timeoutMs",
       env.TARGET_CHALLENGE_TIMEOUT_MS,
@@ -336,7 +407,6 @@ function applyTargetSettingsToEnvironment(
     normalized.solveAttempts,
   );
   setChallengeDefault(env, "TARGET_CHALLENGE_SETTLE_MS", normalized.settleMs);
-  setChallengeDefault(env, "TARGET_CHALLENGE_HOLD_MS", normalized.holdMs);
   setChallengeDefault(env, "TARGET_CHALLENGE_TIMEOUT_MS", normalized.timeoutMs);
   setChallengeDefault(
     env,
@@ -369,18 +439,8 @@ function applyTargetSettingsToEnvironment(
 }
 
 function validateTargetSettingsForRun(executionMode, settings) {
-  const normalized = normalizeTargetSettings(settings);
-  if (executionMode === "observe-only") {
-    return [];
-  }
-  const missing = [];
-  if (!normalized.maxItemPrice) {
-    missing.push("target.max-item-price");
-  }
-  if (!normalized.maxOrderTotal) {
-    missing.push("target.max-order-total");
-  }
-  return missing;
+  normalizeTargetSettings(settings);
+  return [];
 }
 
 module.exports = {
@@ -391,6 +451,7 @@ module.exports = {
   normalizeSettingKey,
   normalizeTargetSettings,
   setTargetSetting,
+  targetSettingOptions,
   targetSettingRows,
   targetSettingsDefaults,
   validateTargetSettingsForRun,

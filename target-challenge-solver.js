@@ -40,18 +40,15 @@ function createSolver({ env = process.env, now = Date.now, wait = sleep } = {}) 
     if (kind !== challengeKind.pressAndHold) {
       throw new Error("CHALLENGE_KIND_UNSUPPORTED");
     }
-    const holdMs = duration(env, "TARGET_CHALLENGE_HOLD_MS", 10000, 100, 15000);
     const timeoutMs = duration(env, "TARGET_CHALLENGE_TIMEOUT_MS", 20000, 1000, 45000);
-    if (timeoutMs < holdMs + 1000) {
-      throw new Error("TARGET_CHALLENGE_TIMEOUT_MS must exceed the hold duration by at least 1000 ms.");
-    }
     const started = now();
     const deadline = started + timeoutMs;
     const remaining = () => deadline - now();
     const run = (operation) => withTimeout(operation, remaining());
-    // Reserve room for the configured hold and release rather than spending the
-    // whole attempt searching. All later operations still share the same deadline.
-    const discoveryDeadline = deadline - holdMs - 500;
+    // Reserve a small margin for pointer-down rather than spending the whole
+    // attempt searching. The remaining budget is the dynamic hold/completion
+    // window; the provider decides when the challenge is complete.
+    const discoveryDeadline = deadline - 500;
     let control;
     let handle;
     let releaseRequired = false;
@@ -112,9 +109,7 @@ function createSolver({ env = process.env, now = Date.now, wait = sleep } = {}) 
       releaseRequired = true;
       await run(() => page.mouse.down({ button: "left" }));
       log("TARGET_CHALLENGE_HOLD_STARTED");
-      const holdUntil = Math.min(now() + holdMs, deadline - 250);
-      while (now() < holdUntil) {
-        await wait(Math.min(100, holdUntil - now()));
+      while (remaining() > 0) {
         if (page.isClosed()) {
           throw new Error("CHALLENGE_PAGE_UNAVAILABLE");
         }
@@ -123,6 +118,15 @@ function createSolver({ env = process.env, now = Date.now, wait = sleep } = {}) 
         const visible = await run(() => handle.isVisible().catch(() => false));
         if (!visible) {
           break;
+        }
+        const evidence = await inspectChallenge(page, {
+          timeoutMs: Math.min(250, Math.max(1, remaining())),
+        });
+        if (!evidence.detected && !evidence.unreadable) {
+          break;
+        }
+        if (remaining() > 0) {
+          await wait(Math.min(100, remaining()));
         }
       }
     } catch (error) {
@@ -167,8 +171,8 @@ function createSolver({ env = process.env, now = Date.now, wait = sleep } = {}) 
       }
     }
     // FINISHED is attempt telemetry, not success. elapsedMs includes discovery,
-    // input, cleanup, and completion waiting; it is NOT the continuous hold time.
-    // Even a still-blocked page can reach here; the driver decides its outcome.
+    // dynamic hold, cleanup, and completion waiting. The driver decides the
+    // outcome from its independent verification.
     log(`TARGET_CHALLENGE_HOLD_FINISHED elapsedMs=${now() - started}`);
   };
 }

@@ -164,7 +164,7 @@ function validatePurchaseEvidence(evidence, {
   if (!Number.isSafeInteger(item?.itemPriceCents)) {
     errors.push("item-price");
   } else if (
-    !Number.isSafeInteger(maxItemPriceCents) ||
+    Number.isSafeInteger(maxItemPriceCents) &&
     item.itemPriceCents > maxItemPriceCents
   ) {
     errors.push("item-price-limit");
@@ -172,7 +172,7 @@ function validatePurchaseEvidence(evidence, {
   if (!Number.isSafeInteger(evidence?.orderTotalCents)) {
     errors.push("order-total");
   } else if (
-    !Number.isSafeInteger(maxOrderTotalCents) ||
+    Number.isSafeInteger(maxOrderTotalCents) &&
     evidence.orderTotalCents > maxOrderTotalCents
   ) {
     errors.push("order-total-limit");

@@ -8,6 +8,7 @@ const {
   defaultRetailerSettings,
   normalizeRetailerSettings,
   productMetadata,
+  resolveProductMetadata,
 } = require("./deals-adapters");
 
 const catalogVersion = 2;
@@ -316,6 +317,7 @@ function resolveUniquePrefix(items, value) {
 function createCatalogStore(filePath, {
   idFactory = () => crypto.randomUUID().replace(/-/g, "").slice(0, 12),
   now = () => new Date().toISOString(),
+  resolveMetadata = resolveProductMetadata,
 } = {}) {
   async function save(catalog) {
     const validated = validateCatalog(catalog);
@@ -324,13 +326,14 @@ function createCatalogStore(filePath, {
     return validated;
   }
 
-  function prepare(input, existing = null) {
-    const name = String(input.name ?? existing?.name ?? "").trim();
-    if (!name) {
-      throw new Error("Product name is required.");
-    }
+  async function prepare(input, existing = null) {
     const inputUrl = normalizeUrl(input.url ?? existing?.url);
-    const metadata = productMetadata(inputUrl);
+    const inputName = String(input.name ?? "").trim();
+    const existingName = String(existing?.name ?? "").trim();
+    const metadata = inputName || existingName
+      ? productMetadata(inputUrl)
+      : await resolveMetadata(inputUrl);
+    const name = inputName || existingName || metadata.name || "Product";
     const url = metadata.normalizedUrl;
     const mode = normalizeMode(
       input.mode === undefined ? existing?.mode : input.mode,
@@ -350,9 +353,15 @@ function createCatalogStore(filePath, {
       armed: armedValue,
       resolvedProductId: metadata.resolvedProductId,
       resolvedUrl: metadata.resolvedUrl,
-      lastStatus: urlChanged ? "Not run" : existing?.lastStatus || "Not run",
-      lastStatusAt: urlChanged ? null : existing?.lastStatusAt || null,
-      terminalOutcome: urlChanged ? null : existing?.terminalOutcome || null,
+      lastStatus: urlChanged
+        ? "Not run"
+        : existing?.lastStatus || "Not run",
+      lastStatusAt: urlChanged
+        ? null
+        : existing?.lastStatusAt || null,
+      terminalOutcome: urlChanged
+        ? null
+        : existing?.terminalOutcome || null,
       createdAt: existing?.createdAt || now(),
       updatedAt: now(),
     };
@@ -392,7 +401,7 @@ function createCatalogStore(filePath, {
     },
     async add(input) {
       const catalog = await loadCatalog(filePath);
-      const item = prepare(input);
+      const item = await prepare(input);
       if (catalog.items.some((existing) => existing.id === item.id)) {
         throw new Error(`Generated duplicate product ID: ${item.id}.`);
       }
@@ -410,7 +419,7 @@ function createCatalogStore(filePath, {
       const catalog = await loadCatalog(filePath);
       const additions = [];
       for (const input of inputs) {
-        const item = prepare(input);
+        const item = await prepare(input);
         if ([...catalog.items, ...additions].some(
           (existing) => existing.id === item.id,
         )) {
@@ -434,7 +443,7 @@ function createCatalogStore(filePath, {
     async update(value, changes) {
       const catalog = await loadCatalog(filePath);
       const existing = resolveUniquePrefix(catalog.items, value);
-      const replacement = prepare(changes, existing);
+      const replacement = await prepare(changes, existing);
       const duplicate = duplicateFor(catalog.items, replacement, existing.id);
       if (duplicate) {
         throw new Error(
@@ -457,7 +466,18 @@ function createCatalogStore(filePath, {
       const selectedIds = new Set(selected.map((item) => item.id));
       catalog.items = catalog.items.map((item) =>
         selectedIds.has(item.id)
-          ? { ...item, armed: Boolean(armed), updatedAt: now() }
+          ? {
+              ...item,
+              armed: Boolean(armed),
+              ...(armed && item.terminalOutcome === "confirmed"
+                ? {
+                    lastStatus: "Not run",
+                    lastStatusAt: null,
+                    terminalOutcome: null,
+                  }
+                : {}),
+              updatedAt: now(),
+            }
           : item,
       );
       await save(catalog);

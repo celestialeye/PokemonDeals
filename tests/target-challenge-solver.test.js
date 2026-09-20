@@ -7,7 +7,6 @@ const { fakePage, fakeTime } = require("./helpers/target-challenge-fakes");
 
 function solver(time = fakeTime(), env = {}) {
   return createSolver({ ...time, env: {
-    TARGET_CHALLENGE_HOLD_MS: "200",
     TARGET_CHALLENGE_TIMEOUT_MS: "1500",
     ...env,
   } });
@@ -82,11 +81,14 @@ test("releases early when the held control disappears", async () => {
   assert.ok(page.state.released);
 });
 
-test("processing after pointer-up waits for page evidence rather than disappearing labels", async () => {
+test("holds until live page evidence clears rather than a fixed duration", async () => {
   const page = fakePage();
   const time = fakeTime((elapsed) => {
     if (elapsed >= 100) page.nodes[0].name = "Processing";
-    if (elapsed >= 900) page.state.body = "Pokemon product";
+    if (elapsed >= 900) {
+      assert.equal(page.state.released, false);
+      page.state.body = "Pokemon product";
+    }
   });
   await solver(time)(context(page));
   assert.equal(time.now(), 900);
@@ -137,14 +139,16 @@ test("generic challenges and closed pages receive no input", async () => {
   assert.equal(page.events.length, 0);
 });
 
-for (const value of ["NaN", "Infinity", "0", "15001", "1.5", ""]) {
-  test(`rejects invalid hold duration ${JSON.stringify(value)}`, async () => {
-    await assert.rejects(() => solver(fakeTime(), { TARGET_CHALLENGE_HOLD_MS: value })(context(fakePage())), /TARGET_CHALLENGE_HOLD_MS/);
+for (const value of ["NaN", "Infinity", "0", "45001", "1.5", ""]) {
+  test(`rejects invalid attempt timeout ${JSON.stringify(value)}`, async () => {
+    await assert.rejects(() => solver(fakeTime(), { TARGET_CHALLENGE_TIMEOUT_MS: value })(context(fakePage())), /TARGET_CHALLENGE_TIMEOUT_MS/);
   });
 }
 
-test("rejects an attempt budget shorter than hold plus cleanup reserve", async () => {
-  await assert.rejects(() => solver(fakeTime(), { TARGET_CHALLENGE_HOLD_MS: "1000", TARGET_CHALLENGE_TIMEOUT_MS: "1500" })(context(fakePage())), /must exceed/);
+test("does not require a fixed hold duration", async () => {
+  const page = fakePage();
+  await solver(fakeTime(), { TARGET_CHALLENGE_TIMEOUT_MS: "1000" })(context(page));
+  assert.ok(page.state.released);
 });
 
 test("a hung pointer command times out and cannot start later solver stages", async () => {
@@ -152,7 +156,7 @@ test("a hung pointer command times out and cannot start later solver stages", as
   let finishDown;
   page.mouse.down = () => new Promise((resolve) => { finishDown = resolve; });
   const logs = [];
-  const solve = createSolver({ env: { TARGET_CHALLENGE_HOLD_MS: "100", TARGET_CHALLENGE_TIMEOUT_MS: "1100" } });
+  const solve = createSolver({ env: { TARGET_CHALLENGE_TIMEOUT_MS: "1100" } });
   await assert.rejects(() => solve({ ...context(page), log: (line) => logs.push(line) }), /CHALLENGE_OPERATION_TIMEOUT/);
   assert.ok(page.events.includes("up"));
   finishDown();
