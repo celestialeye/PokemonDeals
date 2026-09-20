@@ -8,6 +8,7 @@ const {
   parseJobArgument,
   reconcilePendingCart,
   triggerPurchase,
+  waitForPausedPages,
 } = require("../target-watch");
 const { fakePage } = require("./helpers/target-challenge-fakes");
 
@@ -141,6 +142,55 @@ test("validation does not resume an unresolved challenge or unrelated error", ()
   assert.ok(state.remainingPauseMs() > 0);
 });
 
+test("unreadable page retries at the base challenge cooldown", () => {
+  let now = 1000;
+  const state = stateFor({ observe: false, now: () => now });
+  state.pauseForChallenge("unreadable page", { fixed: true });
+  assert.equal(state.remainingPauseMs(), 300000);
+  now += 300000;
+  assert.equal(state.remainingPauseMs(), 0);
+});
+
+test("paused challenge resumes immediately when local page clearance is observed", async () => {
+  let now = 0;
+  let inspections = 0;
+  const state = stateFor({ observe: false, now: () => now });
+  const job = jobFor(fakePage());
+  state.pauseForChallenge("unreadable page", { fixed: true });
+  const resumed = await waitForPausedPages([job], state, {
+    inspect: async () => {
+      inspections += 1;
+      return inspections > 1
+        ? { detected: false, unreadable: false }
+        : { detected: true, unreadable: false };
+    },
+    waitFor: async () => {
+      now += 1000;
+    },
+  });
+  assert.equal(resumed, true);
+  assert.equal(state.isPaused(), false);
+  assert.equal(job.availabilityRequest, null);
+  assert.equal(job.challengeSignal, null);
+  assert.equal(job.nextNavigationAt, 0);
+});
+
+test("solving one paused product keeps other challenge owners paused", () => {
+  let now = 0;
+  const state = stateFor({ observe: false, now: () => now });
+  state.pauseForChallenge("product one", { fixed: true, productId: "A-1" });
+  state.pauseForChallenge("product two", { fixed: true, productId: "A-2" });
+  assert.deepEqual(state.challengePauseProductIds().sort(), ["A-1", "A-2"]);
+
+  state.recordChallengeSolved("press_and_hold", 1, "A-1");
+  assert.equal(state.isPaused(), true);
+  assert.deepEqual(state.challengePauseProductIds(), ["A-2"]);
+
+  state.recordChallengeSolved("press_and_hold", 1, "A-2");
+  assert.equal(state.isPaused(), false);
+  assert.deepEqual(state.challengePauseProductIds(), []);
+});
+
 test("successful recovery does not override poll, time, or malformed-response limits", () => {
   const count = stateFor({ validation: true, maximumPolls: 1 });
   count.recordApiPoll({ status: 403, outcome: "challenge" });
@@ -185,11 +235,16 @@ test("network challenge without live evidence backs off without invoking the sol
 test("initially unreadable state cannot invoke even a custom solver", async () => {
   const page = fakePage({ readError: true });
   let calls = 0;
-  const result = await handleChallenge(jobFor(page), stateFor(), "read failure", {
+  const job = jobFor(page);
+  const result = await handleChallenge(job, stateFor(), "read failure", {
     solver: async () => { calls += 1; }, waitFor: noWait,
   });
   assert.equal(result, "blocked");
   assert.equal(calls, 0);
+  for (const key of ["availabilityRequest", "challengeSignal", "lastSummary", "lastFingerprint"]) {
+    assert.equal(job[key], null);
+  }
+  assert.equal(job.nextNavigationAt, 0);
 });
 
 test("unreadable post-solve state is blocked even when solver returns true", async () => {

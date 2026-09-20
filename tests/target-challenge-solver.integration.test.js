@@ -19,7 +19,6 @@ process.env.TARGET_CHALLENGE_VALIDATE = "1";
 process.env.TARGET_CHALLENGE_SOLVER = require.resolve("../target-challenge-solver");
 process.env.TARGET_CHALLENGE_SOLVE_ATTEMPTS = "2";
 process.env.TARGET_CHALLENGE_SETTLE_MS = "500";
-process.env.TARGET_CHALLENGE_HOLD_MS = "1200";
 process.env.TARGET_CHALLENGE_TIMEOUT_MS = "4000";
 process.env.TARGET_MONITOR_POLL_MS = "2000";
 
@@ -59,9 +58,9 @@ function stateFor(logs = []) {
   return createMonitorState({ observe: true, validation: true, maximumPolls: 10, runtimeMs: 30000,
     log: (line) => logs.push(line), error: (line) => logs.push(line) });
 }
-function localSolver(holdMs = 1200, timeoutMs = 4000) {
+function localSolver(timeoutMs = 4000) {
   return createSolver({ env: {
-    TARGET_CHALLENGE_HOLD_MS: String(holdMs), TARGET_CHALLENGE_TIMEOUT_MS: String(timeoutMs),
+    TARGET_CHALLENGE_TIMEOUT_MS: String(timeoutMs),
   } });
 }
 /** Exercise the production retry contract, including an independent final read. */
@@ -172,7 +171,7 @@ test("provider-style processing beyond settle time is awaited before returning",
   const page = await isolated(t, () => variants);
   await page.goto("https://widget.invalid/?processing=2500");
   const started = Date.now();
-  const result = await resolve(page, localSolver(1200, 6000));
+  const result = await resolve(page, localSolver(6000));
   assert.equal(result.outcome, "cleared");
   assert.ok(Date.now() - started >= 3000);
   assert.equal((await inputEvidence(page)).down, 1);
@@ -183,7 +182,7 @@ test("one-second and ten-second fixture holds complete with native input", { tim
   for (const duration of [1000, 10000]) {
     const page = await isolated(t, () => variants);
     await page.goto(`https://widget.invalid/?duration=${duration}&label=1`);
-    assert.equal((await resolve(page, localSolver(duration, duration + 3000))).outcome, "cleared");
+    assert.equal((await resolve(page, localSolver(duration + 3000))).outcome, "cleared");
     const evidence = await inputEvidence(page);
     assert.equal(evidence.down, 1);
     assert.equal(evidence.up, 1);
@@ -193,8 +192,8 @@ test("one-second and ten-second fixture holds complete with native input", { tim
 
 test("early release resets fixture, stays blocked, and leaves no held pointer", { timeout: 12000 }, async (t) => {
   const page = await isolated(t, () => variants);
-  await page.goto("https://widget.invalid/");
-  assert.equal((await resolve(page, localSolver(100, 1500))).outcome, "unresolved");
+  await page.goto("https://widget.invalid/?duration=2000");
+  assert.equal((await resolve(page, localSolver(1500))).outcome, "unresolved");
   const evidence = await inputEvidence(page);
   assert.equal(evidence.down, evidence.up);
   assert.equal(await page.locator("#status").innerText(), "Hold longer");
@@ -204,7 +203,7 @@ test("early release resets fixture, stays blocked, and leaves no held pointer", 
 test("persistent real-browser fixture exhausts attempts with cleanup on each", { timeout: 15000 }, async (t) => {
   const page = await isolated(t, () => variants);
   await page.goto("https://widget.invalid/?never=1");
-  const result = await resolve(page, localSolver(200, 2000), 2);
+  const result = await resolve(page, localSolver(2000), 2);
   assert.equal(result.outcome, "unresolved");
   const evidence = await inputEvidence(page);
   assert.equal(evidence.down, 2);
@@ -215,7 +214,7 @@ test("disabled and ambiguous controls fail without pointer input", { timeout: 12
   for (const mode of ["disabled", "duplicate"]) {
     const page = await isolated(t, () => variants);
     await page.goto(`https://widget.invalid/?${mode}=1`);
-    assert.equal((await resolve(page, localSolver(100, 1500))).outcome, "failed");
+    assert.equal((await resolve(page, localSolver(1500))).outcome, "failed");
     assert.equal((await inputEvidence(page)).down, 0);
   }
 });

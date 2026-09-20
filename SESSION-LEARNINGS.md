@@ -2,29 +2,50 @@
 
 ## Architecture that worked
 
-Playwright connected to the user's real Chrome profile through the Chrome DevTools Protocol at `http://127.0.0.1:9444`. This avoided foreground-input conflicts and allowed multiple independent pages and workers to operate in the same authenticated browser context.
+Playwright connects to the persistent PokemonDeals Chrome profile through the
+Chrome DevTools Protocol at `http://127.0.0.1:9444`. This avoids foreground-
+input conflicts and allows multiple independent pages and workers to operate
+in the same authenticated browser context without relying on Chrome's protected
+default user-data directory.
 
 The reliable sequence was:
 
-1. Close all Chrome browser processes.
-2. Relaunch the real Chrome user-data directory with `--remote-debugging-port=9444`.
-3. Connect with `playwright-core` using `chromium.connectOverCDP`.
-4. Open dedicated pages from the existing browser context.
+1. Launch the non-default PokemonDeals user-data directory with
+   `--remote-debugging-port=9444`.
+2. Connect with `playwright-core` using `chromium.connectOverCDP`.
+3. Open dedicated pages from the existing browser context.
 
-## Deals purchasing control plane
+The deals control plane now checks the CDP endpoint before a run and launches
+the persistent Windows Chrome profile automatically when the endpoint is
+missing. Sign-in is a one-time operator step in that profile. Patchright versus
+Playwright remains a Target setting passed through `TARGET_BROWSER_DRIVER`;
+Chrome startup only provides the shared CDP context.
 
-The `deals.js` CLI is the operator-facing purchasing engine. Its no-argument
-path lazily loads the focused `neo-blessed` full-screen application from
-`src\deals-tui.js`; direct subcommands do not load the TUI and retain their
-plain-text output.
-It owns the versioned `data\deals.json` catalog, retailer-scoped non-sensitive
+## Deals purchasing engine and operating surfaces
+
+The `deals.js` CLI is the shared purchasing engine with two operation surfaces.
+The AI-agent surface uses direct, non-interactive subcommands and is the
+recommended orchestration path: the agent owns catalog changes, starts an
+explicit execution mode, monitors worker events, and reports or stops on
+terminal evidence. The no-argument path lazily loads the in-development
+`neo-blessed` full-screen application from `src\deals-tui.js`; direct
+subcommands do not load the TUI and retain their plain-text output. Agent
+operation must use an explicit execution mode rather than inheriting a stored
+live default.
+The engine owns the versioned `data\deals.json` catalog, retailer-scoped non-sensitive
 settings, stable IDs, explicit product modes, armed state, execution-mode
 choice, live status, terminal outcome, and child-process lifecycle. Retailer
 adapters own URL recognition, per-retailer armed limits, setting defaults and
 validation, worker arguments, secret-name validation, and output-event parsing.
 This keeps retailer-specific purchase behavior out of the CLI.
 
-The TUI/controller boundary is intentionally one-way. The TUI builds product
+The executable adapter registry currently contains Target only. Amazon and
+Pokémon Center still use their legacy direct workers, so the main agent may
+orchestrate them only through their documented commands and required
+environment inputs.
+
+The TUI remains a development surface. Its controller boundary is intentionally
+one-way. The TUI builds product
 rows and detail views, handles keyboard navigation and modal workflows, and
 projects bounded control-character-stripped logs. Catalog CRUD, grouped-list
 parsing, retailer metadata, settings validation, secret masking/storage,
@@ -33,6 +54,20 @@ remain in their existing modules. `runAdapter()` emits lifecycle notifications
 plus parsed product events after using the adapter parser, matching catalog
 items, and persisting their state; the TUI never reparses worker output. The
 old numbered readline loop is no longer the no-argument experience.
+Opening the TUI with included products, or saving a new product from its Add
+Product form, automatically starts the configured default run after the
+catalog refresh. A live-purchase default starts directly for these automatic
+runs; manually starting Live purchase still opens the typed `LIVE`
+confirmation. Editing or importing products does not start a run automatically.
+Ctrl+C disables automatic starts for the session until the operator starts a
+run again. Only retryable Chrome/CDP startup failures schedule a five-second
+automatic retry; worker exits and unknown outcomes are not replayed.
+The **Run Stats** view is an additive live dashboard opened from the left
+navigation, with `t` available as the in-run shortcut. It consumes the same
+structured lifecycle and parsed-event notifications as the run screen,
+tracking elapsed time, event categories, per-product counters, worker state,
+and a bounded event feed; it does not reparse worker stdout or alter run
+control.
 
 The first registry entry is Target. User mode **Buy** maps to the existing
 Target `add-to-cart` mode; **Buy Now** and **Preorder** map directly. The engine
@@ -98,12 +133,13 @@ profile, cart, and payment state. The three explicit run modes are:
 3. `live-purchase`: permits the existing worker to submit after all of its
    safeguards pass.
 
-Before either active mode starts, the engine requires persisted item/order
-price ceilings and checks for an effective Discord webhook without logging its
-value. Explicit process-environment secrets take precedence over stored values
-for one-off runs. The normal settings view masks stored secrets and reports
-environment override presence; only the explicit reveal action displays stored
-values. Direct commands stream worker stdout/stderr unchanged; the TUI shows a
+Before an active mode starts, any configured item/order price ceilings are
+enforced, and the engine checks for an effective Discord webhook without
+logging its value. Missing ceilings are treated as unlimited. Explicit
+process-environment secrets take precedence over stored values for one-off
+runs. The normal settings view masks stored secrets and reports environment
+override presence; only the explicit reveal action displays stored values.
+Direct commands stream worker stdout/stderr unchanged; the TUI shows a
 bounded, terminal-control-stripped projection so checkout errors and safety
 stops remain visible without allowing worker text to control the interface.
 Existing
@@ -127,8 +163,9 @@ redaction/reveal behavior, secret persistence and environment precedence,
 `target-watch.js`, attach to CDP, contact a retailer, send Discord alerts,
 exercise a challenge, mutate a cart, or validate a live order. Pure and
 synthetic tests now cover TUI rows/details, keyboard action mapping, run
-defaults, grouped-import controller transitions, minimum-size projection, and
-bounded safe event/log projection. Full visual rendering in Windows
+defaults, grouped-import controller transitions, minimum-size projection,
+bounded safe event/log projection, and Run Stats lifecycle/category
+projection. Full visual rendering in Windows
 Terminal, focus behavior across every `neo-blessed` widget, clickable URL
 recognition, authenticated short-link resolution, Ctrl+C cleanup against a real
 worker, and all three live execution modes remain deliberate operator-validation
@@ -511,7 +548,9 @@ Actual same-run evidence:
 - **20:11:28.545Z:** challenge detected; attempt 1/2 began.
 - **20:11:28.905Z:** native hold started; exactly one pointer-down/up pair was issued.
 - **20:11:42.748Z:** native input plus completion waiting finished in **14054 ms**.
-  The maximum continuous hold was 10000 ms; the elapsed figure is not hold duration.
+  The earlier diagnostic used a 10000 ms maximum continuous-hold cap; that was
+  an implementation safety limit, not a provider requirement. The elapsed
+  figure is total attempt time, not hold duration.
 - **20:11:45.721Z:** independent driver verification emitted both
   `TARGET_CHALLENGE_CLEARED after=1` and `TARGET_CHALLENGE_SOLVED`.
 - Stale request state was invalidated; one ordinary product reload captured a fresh

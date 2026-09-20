@@ -30,7 +30,46 @@ node --check monitor.js
 
 `npm test` delegates to `npm run test:unit`. Challenge tests use `node:test` and `node:assert/strict`; other suites also use direct Node assertions. `npm run test:challenge:e2e` launches isolated installed Chrome with locally intercepted fixture traffic, not the authenticated CDP profile. There is no lint script.
 
-Before running a worker, check whether the existing authenticated Chrome already exposes CDP on port `9444`; reuse that context when available, rather than creating a fresh profile. Only if CDP is unavailable should the intended profile be closed and restarted with debugging enabled as documented in `README.md`. Verify the endpoint with:
+## Operating modes
+
+There are two operator surfaces over the same `deals.js` engine:
+
+- **AI-agent operations:** this is the non-interactive orchestration path. For
+  product polling or purchasing requests, operate through direct `pokemon`
+  subcommands; do not drive the TUI and do not delegate the live operation to
+  the development `/deals` harness.
+- **Full-screen TUI:** `pokemon` with no arguments opens `src/deals-tui.js`.
+  The TUI is still in development and is not the agent automation contract.
+
+The engine registry currently has a Target adapter only. For Amazon or Pokémon
+Center, use the documented legacy direct worker only when the user supplied
+the required scope and inputs.
+
+For an operational request, the main agent is the orchestrator. Inspect
+`pokemon list` and `pokemon settings`, make only the requested
+catalog/settings changes, then start the attached process with
+`pokemon monitor --execution <mode>` and monitor its structured output through
+the terminal tool. Never start competing workers against the shared profile.
+
+Map polling/availability requests to `observe-only`. Use
+`stop-before-submit` when the user wants cart/checkout preparation without
+submission. Use `live-purchase` only when the user explicitly requests purchase
+of the exact included products; never infer purchase authorization from the
+stored default. An explicit request such as "buy/purchase these included
+products" authorizes that one scoped live run.
+Report explicit confirmation and every terminal stop. If verification appears,
+allow only the worker's existing bounded recovery/backoff behavior; never
+bypass it or accelerate polling. Report unresolved verification, safety stops,
+ambiguous outcomes, interruptions, and worker failures precisely.
+
+The `/deals` prompt and `.pi` agents are development-only. They may edit and
+verify source offline but never operate a worker or grant purchase authority.
+
+Before running the deals control-plane engine, it checks whether the existing
+authenticated Chrome already exposes CDP on port `9444`, reuses that context
+when available, and automatically launches the configured Windows Chrome
+profile with debugging when it is unavailable. Standalone workers still
+require the documented manual CDP startup. Verify the endpoint with:
 
 ```powershell
 Invoke-RestMethod 'http://127.0.0.1:9444/json/version'
@@ -38,21 +77,28 @@ Invoke-RestMethod 'http://127.0.0.1:9444/json/version'
 
 The project-scoped `.github/mcp.json` registers Playwright MCP against the same CDP endpoint for browser inspection and testing. Start the authenticated Chrome instance before using that MCP server.
 
-The supported operational commands are:
+Legacy worker commands are:
 
 ```powershell
 npm run target:checkout
 npm run target:watch
 npm run target:preorder
+npm run pokemoncenter:preorder
 npm run amazon:preorder
+npm run amazon:multi-preorder
 npm run amazon:checkout
 ```
 
-The checkout commands can submit real orders; `target:preorder` is the cart-monitoring step. Follow the environment-variable setup and safety checks in `README.md` before invoking any worker.
+Prefer the `pokemon` engine for AI-agent operations because it centralizes
+catalog validation, settings, secret application, CDP bootstrap, status
+persistence, and child lifecycle. The legacy checkout commands can submit real
+orders; `target:preorder` is the cart-monitoring step. Follow the
+environment-variable setup and safety checks in `README.md` before invoking any
+worker.
 
 ## Architecture
 
-- **Shared browser runtime:** Every worker calls `chromium.connectOverCDP("http://127.0.0.1:9444")`, uses the first existing browser context, and opens its own page. The outer loop reconnects when Chrome or a page is unavailable.
+- **Shared browser runtime:** Every worker calls `chromium.connectOverCDP("http://127.0.0.1:9444")`, uses the first existing browser context, and opens its own page. The deals engine bootstraps the persistent non-default PokemonDeals Chrome profile when needed; the outer loop reconnects when Chrome or a page is unavailable.
 - **Target URL watch (`target-watch.js`):** One global availability-request queue and one mutation queue serialize polling and cart actions. Optional `target-challenge-solver.js` performs bounded native press-and-hold input; `target-challenge-page.js` independently inspects the main page and visible frames, failing closed on unreadable state. Post-click solving already owns the mutation queue and must not re-enqueue itself. A bounded isolated real-Target retry confirmed the same-run cleared/solved events followed by two fresh HTTP 200 polls, using a 45-second attempt budget. Default-budget and normal authenticated-session reliability remain unverified; the optional diagnostic refresh fallback was not exercised or added to the bundled solver. Use the browser-native frame tree for closed-shadow iframe discovery, check owner/ancestor visibility, and wait for page clearance rather than label disappearance; see the session evidence.
 - **Target checkout (`monitor.js`):** A page-local state machine handles `/cart` redirects, manual verification pauses, high-demand dialogs, shipping `Save and continue`, the `TARGET_PIN` confirmation dialog, and repeated order attempts. It exits only after explicit order-confirmation text or URL evidence.
 - **Target preorder (`preorder.js`):** The configured Target product IDs are monitored in one reusable tab per product, with a stagger between pages. `PRODUCT_FILTER` narrows the set. A product tab closes after a cart-add signal; verification pauses only the affected tab, and reconnect cleanup closes the active batch before new tabs are created.
@@ -64,7 +110,10 @@ The checkout commands can submit real orders; `target:preorder` is the cart-moni
 ## Repository-specific conventions
 
 - Keep the code CommonJS. Use Patchright only through the Target URL watch's driver switch and retain `playwright-core` as its fallback and as the driver for existing workers. Use the existing Node assertion/test harness; do not introduce a framework or bundler for routine changes.
-- Pass secrets and transient session data through environment variables only: `TARGET_PIN`, `PRODUCT_FILTER`, the `AMAZON_*` inputs, and especially `AMAZON_CHECKOUT_URL`. Never hardcode PINs, credentials, or short-lived checkout URLs.
+- Pass secrets and transient session data through environment variables only:
+  `TARGET_PIN`, `PRODUCT_FILTER`, the `AMAZON_*` inputs, and especially
+  `AMAZON_CHECKOUT_URL`. Never hardcode PINs, credentials, or short-lived
+  checkout URLs.
 - Preserve the state-machine ordering. Detect verification before taking actions; handle Target's `Item not added to cart` failure before treating cart-related text as success; validate product identity and price/total guards before Amazon checkout actions; treat a click as successful only after the resulting page state is confirmed.
 - Use resilient accessible selectors (`getByRole`, `getByText`, and regular expressions) because Target and Amazon vary button labels such as `Place order` and `Place your order`. Check that controls are visible and enabled before clicking.
 - Verification detection intentionally combines URL, title, and body-text patterns. Other workers retain manual handling. Only the Target URL watch supports an explicitly configured press-and-hold solver; preserve independent live inspection, bounded input cleanup, serialized work, and unresolved-challenge backoff. Observe-only normally stops on challenge; `TARGET_CHALLENGE_VALIDATE=1` permits verified recovery only, never unrelated-error or limit resets. Do not deliberately hammer Target to trigger verification.

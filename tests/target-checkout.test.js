@@ -209,7 +209,7 @@ test("cart validation accepts only expected products with quantity one", () => {
   );
 });
 
-test("purchase guard parsing handles currency and required limits", () => {
+test("purchase guard parsing handles currency and optional limits", () => {
   assert.equal(parseUnambiguousCurrencyCents("$1,234.56"), 123456);
   assert.equal(parseUnambiguousCurrencyCents("$19.99 $29.99"), null);
   assert.equal(
@@ -229,6 +229,14 @@ test("purchase guard parsing handles currency and required limits", () => {
       expectedFulfillment: "shipping",
       maxItemPriceCents: 4999,
       maxOrderTotalCents: 6000,
+    },
+  );
+  assert.deepEqual(
+    readPurchaseGuardConfig({}, { required: false }),
+    {
+      expectedFulfillment: null,
+      maxItemPriceCents: null,
+      maxOrderTotalCents: null,
     },
   );
   assert.throws(
@@ -254,6 +262,13 @@ test("purchase validation requires one exact guarded item", () => {
     orderTotalCents: 5500,
   };
   assert.equal(validatePurchaseEvidence(valid, config).ok, true);
+  assert.equal(
+    validatePurchaseEvidence(valid, {
+      expectedProductId: "A-1007918679",
+      expectedFulfillment: "shipping",
+    }).ok,
+    true,
+  );
   for (const evidence of [
     { ...valid, items: [] },
     { ...valid, items: [valid.items[0], { ...valid.items[0] }] },

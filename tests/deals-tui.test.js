@@ -7,16 +7,19 @@ const {
   createChunkLogSink,
   createDealsTui,
   createImportController,
+  createRunProjection,
   navigationItems,
   palette,
   productDetail,
   productTableHeader,
   productRows,
+  projectRunLifecycle,
   projectRunEvent,
   runSetupDefaults,
   safeLogLine,
   statusColor,
   terminalSizeState,
+  formatRunElapsed,
 } = require("../src/deals-tui");
 const { targetSettingsDefaults } = require("../src/target-deal-settings");
 
@@ -68,7 +71,15 @@ async function waitFor(predicate, message = "condition") {
   assert.fail(`Timed out waiting for ${message}.`);
 }
 
-function createTuiHarness(storeOverrides = {}) {
+function createTuiHarness(
+  storeOverrides = {},
+  {
+    initialItems = [],
+    autoStart = true,
+    autoRestartDelayMs = 5000,
+    runEngine = null,
+  } = {},
+) {
   const input = new PassThrough();
   input.isTTY = true;
   input.setRawMode = () => input;
@@ -78,15 +89,21 @@ function createTuiHarness(storeOverrides = {}) {
   output.rows = 40;
   output.on("data", () => {});
 
-  let items = [];
+  let items = [...initialItems];
   const calls = {
     add: [],
     addMany: [],
+    run: [],
+    setSetting: [],
     update: [],
   };
   const store = {
     list: async () => items,
     getSettings: async () => ({ ...targetSettingsDefaults }),
+    setSetting: async (retailer, key, value) => {
+      calls.setSetting.push({ retailer, key, value });
+      return value;
+    },
     add: async (inputValue) => {
       calls.add.push(inputValue);
       const saved = product({ ...inputValue, id: `item-${calls.add.length}` });
@@ -118,11 +135,29 @@ function createTuiHarness(storeOverrides = {}) {
       set: async () => {},
       clear: async () => {},
     },
-    runEngine: async () => ({ code: 0, signal: null, interrupted: false }),
+    runEngine: runEngine || (async (...args) => {
+      calls.run.push(args);
+      return { code: 0, signal: null, interrupted: false };
+    }),
     input,
     output,
+    autoStart,
+    autoRestartDelayMs,
   });
   return { calls, store, tui };
+}
+
+function findWidget(root, name) {
+  if (root?.name === name) {
+    return root;
+  }
+  for (const child of root?.children || []) {
+    const match = findWidget(child, name);
+    if (match) {
+      return match;
+    }
+  }
+  return null;
 }
 
 test("TUI product rows and detail preserve operator-facing state and raw URLs", () => {
@@ -161,10 +196,64 @@ test("TUI product rows and detail preserve operator-facing state and raw URLs", 
   });
 });
 
+test("focused pane uses a distinct background from inactive selections", async () => {
+  const { tui } = createTuiHarness({
+    list: async () => [product()],
+  }, { autoStart: false });
+  try {
+    await tui.ready;
+    const navigation = findWidget(tui.screen, "navigation");
+    const productTable = findWidget(tui.screen, "product-table");
+    assert.equal(navigation.style.selected.bg, palette.panelAlt);
+    assert.equal(productTable.style.selected.bg, palette.focus);
+
+    await tui.handleAction("focus-navigation");
+    assert.equal(tui.state.focus, "navigation");
+    assert.equal(navigation.style.selected.bg, palette.focus);
+    assert.equal(
+      findWidget(tui.screen, "product-table").style.selected.bg,
+      palette.panelAlt,
+    );
+  } finally {
+    tui.destroy();
+  }
+});
+
+test("navigation position survives switching focus to content", async () => {
+  const { tui } = createTuiHarness();
+  try {
+    await tui.ready;
+    await tui.handleAction("focus-navigation");
+    await tui.handleAction("next");
+    await tui.handleAction("next");
+    await tui.handleAction("next");
+    assert.equal(tui.screen.children.find((child) => child.name === "navigation").selected, 3);
+
+    await tui.handleAction("focus-content");
+    assert.equal(tui.state.focus, "content");
+    assert.equal(tui.screen.children.find((child) => child.name === "navigation").selected, 3);
+
+    await tui.handleAction("settings");
+    assert.equal(tui.state.view, "settings");
+    assert.equal(tui.screen.children.find((child) => child.name === "navigation").selected, 5);
+  } finally {
+    tui.destroy();
+  }
+});
+
 test("keyboard mapping covers primary navigation and product actions", () => {
   assert.deepEqual(
     navigationItems.map((item) => item.id),
-    ["products", "import", "add", "run-setup", "settings", "secrets", "help"],
+    [
+      "products",
+      "import",
+      "add",
+      "run-setup",
+      "run-stats",
+      "settings",
+      "secrets",
+      "help",
+    ],
   );
   assert.equal(actionForKey("up"), "previous");
   assert.equal(actionForKey({ full: "j" }), "next");
@@ -175,6 +264,7 @@ test("keyboard mapping covers primary navigation and product actions", () => {
   assert.equal(actionForKey("i"), "import");
   assert.equal(actionForKey("d"), "delete");
   assert.equal(actionForKey("r"), "run");
+  assert.equal(actionForKey("t"), "run-stats");
   assert.equal(actionForKey("s"), "settings");
   assert.equal(actionForKey("escape"), "back");
   assert.equal(actionForKey("q"), "quit");
@@ -182,7 +272,11 @@ test("keyboard mapping covers primary navigation and product actions", () => {
 });
 
 test("run setup uses armed products, stored solver choice, and safe default mode", () => {
-  const items = [product(), product({ id: "two", armed: false })];
+  const items = [
+    product(),
+    product({ id: "two", armed: false }),
+    product({ id: "confirmed", terminalOutcome: "confirmed" }),
+  ];
   assert.deepEqual(
     runSetupDefaults(items, targetSettingsDefaults),
     {
@@ -198,6 +292,54 @@ test("run setup uses armed products, stored solver choice, and safe default mode
     }).executionMode,
     "observe-only",
   );
+});
+
+test("TUI starts the configured run when it opens with included products", async () => {
+  const { calls, tui } = createTuiHarness({}, {
+    initialItems: [product({ id: "existing-product" })],
+  });
+  try {
+    await tui.ready;
+    await waitFor(
+      () => calls.run.length === 1 && !tui.state.running,
+      "startup auto-run",
+    );
+    assert.equal(calls.run[0][1], "stop-before-submit");
+    assert.equal(tui.state.view, "run");
+  } finally {
+    await new Promise((resolve) => setImmediate(resolve));
+    tui.destroy();
+  }
+});
+
+test("choice settings use described selectors instead of free text", async () => {
+  const { calls, tui } = createTuiHarness();
+  try {
+    await tui.ready;
+    await tui.handleAction("settings");
+    await tui.handleAction("activate");
+    const modal = tui.state.modal;
+    const choices = modal.children.find((child) => child.type === "list");
+    assert.ok(choices);
+    assert.equal(
+      modal.children.some((child) => child.type === "textbox"),
+      false,
+    );
+    assert.match(
+      choices.children.find((child) => /Observe/.test(child.content)).content,
+      /Observe.*Monitor availability/i,
+    );
+    choices.select(2);
+    emitKey(choices, "enter");
+    await waitFor(() => tui.state.modal === null, "setting selector save");
+    assert.deepEqual(calls.setSetting[0], {
+      retailer: "target",
+      key: "default-run-mode",
+      value: "live",
+    });
+  } finally {
+    tui.destroy();
+  }
 });
 
 test("import controller requires a valid preview and explicit product mode", async () => {
@@ -218,7 +360,7 @@ test("import controller requires a valid preview and explicit product mode", asy
   );
   await assert.rejects(controller.confirm(), /Select Buy Now, Preorder, or Buy/);
   controller.selectMode("Preorder");
-  assert.equal(controller.toggleArmed(), true);
+  assert.equal(controller.state.armed, true);
   const added = await controller.confirm();
   assert.equal(added.length, 1);
   assert.deepEqual(
@@ -267,6 +409,20 @@ test("run event and log projection is bounded and strips terminal controls", () 
     important: true,
   });
   assert.match(projected.logs[0], /Safety stop/);
+  projected = projectRunEvent(projected, {
+    retailer: "target",
+    itemIds: ["product-one"],
+    event: {
+      status: "Verification backoff",
+      backoffMs: 2984894,
+      important: true,
+    },
+    at: "2026-09-19T18:01:00.000Z",
+  });
+  assert.equal(
+    projected.backoffUntil,
+    new Date(Date.parse("2026-09-19T18:01:00.000Z") + 2984894).toISOString(),
+  );
   projected.logs = appendProjectedLog(["first", "second"], "third", 2);
   assert.deepEqual(projected.logs, ["second", "third"]);
 
@@ -278,22 +434,134 @@ test("run event and log projection is bounded and strips terminal controls", () 
   assert.deepEqual(lines, ["ERR: one", "ERR: two", "ERR: three"]);
 });
 
+test("run stats projection tracks live event categories and lifecycle", () => {
+  const started = "2026-09-19T18:00:00.000Z";
+  const checked = "2026-09-19T18:00:05.000Z";
+  let projected = projectRunLifecycle(createRunProjection(), {
+    type: "starting",
+    retailer: "target",
+    mode: "observe-only",
+    itemIds: ["product-one"],
+    at: started,
+  });
+  projected = projectRunEvent(projected, {
+    retailer: "target",
+    itemIds: ["product-one"],
+    event: {
+      status: "Monitoring (HTTP 200)",
+    },
+    at: checked,
+  });
+  projected = projectRunEvent(projected, {
+    retailer: "target",
+    itemIds: ["product-one"],
+    event: {
+      status: "Verification detected",
+      important: true,
+    },
+    at: "2026-09-19T18:00:06.000Z",
+  });
+  projected = projectRunEvent(projected, {
+    retailer: "target",
+    itemIds: ["product-one"],
+    event: {
+      status: "Safety stop: ready-to-submit",
+      terminalOutcome: "ready-to-submit",
+      important: true,
+    },
+    at: "2026-09-19T18:00:07.000Z",
+  });
+  projected = projectRunLifecycle(projected, {
+    type: "closed",
+    retailer: "target",
+    mode: "observe-only",
+    itemIds: ["product-one"],
+    code: 0,
+    signal: null,
+    interrupted: false,
+    at: "2026-09-19T18:00:08.000Z",
+  });
+
+  assert.equal(projected.eventCount, 3);
+  assert.equal(projected.pollCount, 1);
+  assert.equal(projected.verificationCount, 1);
+  assert.equal(projected.errorCount, 1);
+  assert.equal(projected.terminalCount, 1);
+  assert.equal(projected.productStats["product-one"].polls, 1);
+  assert.equal(projected.productStats["product-one"].errors, 1);
+  assert.equal(projected.productStats["product-one"].terminalOutcome, "ready-to-submit");
+  assert.equal(projected.workers.target.status, "completed");
+  assert.equal(projected.startedAt, started);
+  assert.equal(projected.endedAt, "2026-09-19T18:00:08.000Z");
+  assert.equal(formatRunElapsed(started, projected.endedAt), "00:08");
+});
+
+test("Run Stats view renders bounded live panels", async () => {
+  const { tui } = createTuiHarness({}, {
+    autoStart: false,
+    initialItems: [product()],
+  });
+  try {
+    await tui.ready;
+    await tui.handleAction("run-stats");
+    assert.equal(tui.state.view, "run-stats");
+    assert.ok(findWidget(tui.screen, "run-stats-activity"));
+    assert.ok(findWidget(tui.screen, "run-stats-events"));
+    assert.ok(findWidget(tui.screen, "run-stats-feed"));
+  } finally {
+    tui.destroy();
+  }
+});
+
+test("Run Stats remains selected through active-run completion", async () => {
+  const pendingRun = deferred();
+  const { tui } = createTuiHarness({}, {
+    initialItems: [product({ id: "live-stats-product" })],
+    runEngine: async (...args) => {
+      args[2].onLifecycle({
+        type: "starting",
+        retailer: "target",
+        mode: "observe-only",
+        itemIds: ["live-stats-product"],
+      });
+      await pendingRun.promise;
+      return { code: 0, signal: null, interrupted: false };
+    },
+  });
+  try {
+    await tui.ready;
+    await waitFor(() => tui.state.running, "active stats run");
+    await tui.handleAction("run-stats");
+    assert.equal(tui.state.view, "run-stats");
+    pendingRun.resolve();
+    await waitFor(() => !tui.state.running, "stats run completion");
+    assert.equal(tui.state.view, "run-stats");
+  } finally {
+    tui.destroy();
+  }
+});
+
 test("focused neo-blessed form children route Add and Edit saves once", async () => {
   const { calls, tui } = createTuiHarness();
   try {
     await tui.ready;
     await tui.handleAction("add");
     const addModal = tui.state.modal;
-    const [name, group, url] = addModal.children.filter(
+    const [url] = addModal.children.filter(
       (child) => child.type === "textbox",
     );
-    name.setValue("Added Product");
-    group.setValue("Test Group");
     url.setValue("https://www.target.com/p/-/A-1000000002");
-    emitKey(name, "s", { full: "C-s", ctrl: true });
-    await waitFor(() => tui.state.modal === null, "Add modal save");
+    emitKey(url, "s", { full: "C-s", ctrl: true });
+    await waitFor(
+      () => tui.state.modal === null && !tui.state.running,
+      "Add modal save and run",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
     assert.equal(calls.add.length, 1);
-    assert.equal(calls.add[0].name, "Added Product");
+    assert.equal(calls.add[0].name, "");
+    assert.equal(calls.add[0].group, "");
+    assert.equal(calls.add[0].armed, true);
+    assert.equal(calls.run.length, 1);
 
     await tui.handleAction("edit");
     const editModal = tui.state.modal;
@@ -308,7 +576,7 @@ test("focused neo-blessed form children route Add and Edit saves once", async ()
   }
 });
 
-test("focused Import children route F2, Space, Enter, and one-press Escape", async () => {
+test("focused Import children route F2, Enter, and one-press Escape", async () => {
   const { calls, tui } = createTuiHarness();
   try {
     await tui.ready;
@@ -323,10 +591,11 @@ test("focused Import children route F2, Space, Enter, and one-press Escape", asy
 
     let previewModal = tui.state.modal;
     let modes = previewModal.children.find((child) => child.type === "list");
-    let armed = previewModal.children.find((child) => child.type === "checkbox");
-    emitKey(modes, "space", { ch: " " });
-    assert.equal(armed.checked, true);
-    emitKey(armed, "f2");
+    assert.equal(
+      previewModal.children.some((child) => child.type === "checkbox"),
+      false,
+    );
+    emitKey(modes, "f2");
 
     const pasteModal = tui.state.modal;
     assert.notEqual(pasteModal, previewModal);
@@ -347,6 +616,102 @@ test("focused Import children route F2, Space, Enter, and one-press Escape", asy
     );
     emitKey(focusedInput, "escape");
     assert.equal(tui.state.modal, null);
+  } finally {
+    tui.destroy();
+  }
+});
+
+test("product form Tab moves through add controls", async () => {
+  const { tui } = createTuiHarness();
+  try {
+    await tui.ready;
+    await tui.handleAction("add");
+    const modal = tui.state.modal;
+    const url = modal.children.find((child) => child.type === "textbox");
+    const modes = modal.children.find((child) => child.type === "list");
+    assert.equal(modal.screen.focused, url);
+    emitKey(url, "tab");
+    assert.equal(modal.screen.focused, modes);
+    emitKey(modes, "tab");
+    assert.equal(modal.screen.focused, url);
+  } finally {
+    tui.destroy();
+  }
+});
+
+test("product form Enter saves from the mode list and starts the configured run", async () => {
+  const { calls, tui } = createTuiHarness();
+  try {
+    await tui.ready;
+    await tui.handleAction("add");
+    const modal = tui.state.modal;
+    const url = modal.children.find((child) => child.type === "textbox");
+    const modes = modal.children.find((child) => child.type === "list");
+    url.setValue("https://www.target.com/p/-/A-1000000004");
+    modes.select(2);
+    emitKey(modes, "enter");
+    await waitFor(
+      () => tui.state.modal === null && !tui.state.running && tui.state.view === "run",
+      "Enter product save and run",
+    );
+    assert.equal(calls.add.length, 1);
+    assert.equal(calls.add[0].url, "https://www.target.com/p/-/A-1000000004");
+    assert.equal(calls.add[0].mode, "buy");
+    assert.equal(calls.run.length, 1);
+    assert.equal(calls.run[0][1], "stop-before-submit");
+    assert.match(tui.state.notice, /Run completed/);
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    tui.destroy();
+  }
+});
+
+test("live-purchase default starts automatically without confirmation", async () => {
+  const { calls, tui } = createTuiHarness({
+    getSettings: async () => ({
+      ...targetSettingsDefaults,
+      defaultRunMode: "live",
+    }),
+  });
+  try {
+    await tui.ready;
+    await tui.handleAction("add");
+    const addModal = tui.state.modal;
+    const url = addModal.children.find((child) => child.type === "textbox");
+    url.setValue("https://www.target.com/p/-/A-1000000005");
+    emitKey(url, "enter");
+    await waitFor(
+      () => calls.run.length === 1 && !tui.state.running && tui.state.modal === null,
+      "live auto-run",
+    );
+    assert.equal(calls.run[0][1], "live-purchase");
+  } finally {
+    await new Promise((resolve) => setImmediate(resolve));
+    tui.destroy();
+  }
+});
+
+test("automatic runs retry retryable startup failures until explicitly stopped", async () => {
+  let attempts = 0;
+  const { tui } = createTuiHarness({}, {
+    initialItems: [product({ id: "retry-product" })],
+    autoRestartDelayMs: 5,
+    runEngine: async () => {
+      attempts += 1;
+      const error = new Error("Chrome CDP unavailable");
+      error.retryable = true;
+      throw error;
+    },
+  });
+  try {
+    await tui.ready;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.ok(attempts >= 2, `Expected a retry, got ${attempts} attempt(s).`);
+    await tui.handleAction("stop-run");
+    assert.equal(tui.state.autoRunEnabled, false);
+    const stoppedAttempts = attempts;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(attempts, stoppedAttempts);
   } finally {
     tui.destroy();
   }

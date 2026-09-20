@@ -1,10 +1,58 @@
 # PokemonDeals
 
-Playwright scripts for monitoring high-demand Pokemon product and checkout flows in an existing authenticated Chrome profile.
+Playwright scripts for monitoring high-demand Pokemon product and checkout flows in the persistent PokemonDeals Chrome profile.
 
 These scripts can add products to a cart and submit real orders. Run them only when you intend to make a purchase, verify the active cart, shipping address, payment method, and quantities first, and stop duplicate workers after one order succeeds.
 
-## Full-screen purchasing control plane
+## Operating modes
+
+PokemonDeals has two operator surfaces over the same catalog, adapter,
+validation, browser-bootstrap, and worker engine:
+
+1. **AI-agent operations:** talk to the repository-aware AI agent and have it
+   manage products, validate the intended run, start polling or purchasing,
+   monitor structured worker output, and stop/report the terminal outcome.
+   This is the recommended path for non-interactive operation.
+2. **Full-screen TUI:** run `pokemon` with no arguments. The TUI is still in
+   development and is useful for interactive catalog and run-state work, but it
+   is not the automation contract for the AI agent.
+
+The shared engine's executable adapter registry currently contains Target
+only. Amazon and Pokémon Center remain legacy direct workers; the AI agent can
+orchestrate those documented commands when their required inputs are supplied.
+
+### AI-agent operations
+
+The agent uses direct `pokemon` commands rather than driving or scraping the
+TUI. Before every run it should inspect the catalog and settings, then make
+only the requested changes:
+
+```powershell
+pokemon list
+pokemon settings
+```
+
+The agent then runs the shared engine with an explicit mode:
+
+```powershell
+pokemon monitor --execution observe-only
+pokemon monitor --execution stop-before-submit
+pokemon monitor --execution live-purchase
+```
+
+An availability/polling request maps to `observe-only` unless the user asks for
+cart or checkout actions. A request to prepare checkout without submitting
+maps to `stop-before-submit`. The agent may use `live-purchase` only when the
+user has explicitly asked it to purchase the exact included products; it must
+not infer live authorization from a stored default. During operation the agent
+owns the attached worker process, watches the streamed status and terminal
+events, reports unresolved verification or safety stops, and never launches a
+competing worker against the shared browser profile.
+
+The development `/deals` harness is separate: it maintains and verifies source
+code offline and never operates a retailer worker.
+
+### Full-screen TUI (in development)
 
 Install dependencies and link the local command once, then launch the terminal
 application with no arguments:
@@ -25,32 +73,54 @@ keyboard map is always visible:
 |---|---|
 | arrows or `j`/`k` | Move through products, settings, secrets, and run choices |
 | `Enter` | Open or confirm the selected action |
-| `Space` | Arm or disarm the selected product |
+| `Space` | Include or exclude the selected product from the next run |
 | `a` / `e` / `i` / `d` | Add, edit, import, or delete |
 | `r` / `s` | Open run setup or Target settings |
+| `t` | Open the live Run Stats view |
 | `Esc` | Close a modal or return to Products |
 | `q` | Quit when no worker is active |
-| `Ctrl+C` | Stop an active child worker through the existing cleanup path |
+| `Ctrl+C` | Stop an active child worker and disable automatic starts until `r` |
 
-The **Products** screen shows armed state, product mode, retailer, name, group,
-status, and last check. Its detail pane keeps the complete raw URL and resolved
-URL visible so Windows Terminal can recognize and open them. **Add** and
-**Edit** use centered forms. **Import** accepts the grouped list format in a
-multiline paste window, then requires preview, one product mode, an armed
-choice, and confirmation. **Settings** edits the navigable Target setting list
-with existing validation. **Secrets** masks values and requires separate
-set/clear/reveal actions.
+The **Products** screen shows whether each product is included in a run, product
+mode, retailer, name, group, status, and last check. Its detail pane keeps the
+complete raw URL and resolved URL visible so Windows Terminal can recognize and
+open them. **Add** asks only for a URL and product mode. The catalog resolves
+the product name from known metadata or the product page, with a URL-derived
+fallback when necessary; group metadata is managed internally rather than
+entered in the form. New products are included automatically, and saving from
+**Add** starts the configured default run. A configured `live-purchase` mode
+starts directly for automatic runs; manually starting Live purchase from
+**Run Engine** still requires the typed `LIVE` confirmation. **Edit** retains
+optional metadata
+overrides for existing entries. **Import** accepts the
+grouped list format in a multiline paste window, then requires preview, one
+product mode, and confirmation; imported products are included automatically.
+**Settings** edits the navigable Target setting list with existing validation.
+**Secrets** masks values and requires separate set/clear/reveal actions.
 
-**Run Engine** lists armed products and offers Observe, Stop before submit
-(default), and Live purchase. It also exposes the stored solver default.
-Live purchase requires typing `LIVE` in a confirmation that summarizes
-products, product modes, price limits, fulfillment, and solver state. During a
-run, the application shows per-product status and a bounded scrolling worker
-log. The TUI consumes the existing engine/adapters and does not reimplement
-retailer parsing, checkout, or safety guards.
+The TUI starts the configured run automatically when it opens with included
+products and after a new product is saved. **Run Engine** remains available to
+change the mode or manually restart after an operator stop. It offers Observe,
+Stop before submit (default), and Live purchase. It also exposes the stored
+solver default. If Chrome/CDP startup fails, the TUI retries after five
+seconds; worker exits and unknown outcomes stop for safety rather than
+replaying a live transaction.
+When Target enters verification backoff, the TUI shows the remaining delay;
+the worker intentionally does not refresh or send requests until that delay
+expires.
+Manual Live purchase requires typing `LIVE` in a confirmation that summarizes
+products, product modes, price limits, fulfillment, and solver state. Automatic
+starts use the persisted default mode directly. During a run, the application
+shows per-product status and a bounded scrolling worker log. **Run Stats** is a
+separate live dashboard for the current run: it shows elapsed time, terminal
+product outcomes, structured event and poll counts, availability, actions,
+verification, alerts, per-product activity, worker state, and a bounded live
+event feed. Press `t` while a worker is active to switch to it. The TUI
+consumes the existing engine/adapters and does not reimplement retailer
+parsing, checkout, or safety guards.
 
-All existing direct subcommands remain available and retain their plain-text
-output for scripts, redirected input, and automation; see
+All direct subcommands remain available and retain their plain-text output for
+scripts and redirected input. See
 [Direct commands](#direct-commands).
 
 ## Scripts
@@ -70,8 +140,9 @@ output for scripts, redirected input, and automation; see
 - Windows
 - Node.js 20 or newer
 - Python 3.10 or newer for Discord alerts
-- Google Chrome
-- Chrome started with the authenticated profile and CDP enabled on port `9444`
+- Google Chrome installed
+- A one-time authenticated PokemonDeals Chrome profile; the deals engine
+  starts it with CDP on port `9444` when needed
 
 Install dependencies:
 
@@ -94,23 +165,33 @@ Install the local command once:
 npm link
 ```
 
-After that, `pokemon` opens the full-screen control plane from any PowerShell
-directory. `npm run deals` remains available as a repository-local fallback.
+After that, `pokemon` with no arguments opens the in-development full-screen
+TUI from any PowerShell directory. The AI-agent path uses the direct commands
+below. `npm run deals` remains available as a repository-local fallback.
 The purchasing engine uses the versioned
-`data\deals.json` catalog. It can list, add, paste/import, edit, arm/disarm,
+`data\deals.json` catalog. It can list, add, paste/import, edit, include/exclude
+(the compatibility commands are arm/disarm),
 delete, configure settings/secrets, and run products. The main catalog contains
 product metadata, non-sensitive settings, and status only. The separate ignored
 `data\deals-secrets.local.json` file may contain the Target PIN and Discord
 webhook; cookies, authentication, payment data, card details, addresses, and
 checkout URLs are never stored by the CLI.
 
-Start with **Add Product** or **Import**, choose an explicit Buy Now, Preorder,
-or Buy product mode, configure price limits and secrets, arm up to three Target
-products, and review **Run Engine**. The initial execution mode is
+Start with **Add Product** or **Import**, paste a product URL, and choose an
+explicit Buy Now, Preorder, or Buy product mode. Saving **Add Product** starts
+the configured default run; use **Run Engine** to start or review runs for
+existing products. Names are resolved automatically, and new products are
+included without an extra toggle. The initial execution mode is
 `stop-before-submit`.
 
-Grouped paste input uses headings ending in `:` and `Name: URL` product lines.
-Missing `https://` is added before preview:
+For an unknown URL, the catalog follows redirects and reads the product page
+title when available, then falls back to the URL path or a safe product label.
+An included product is eligible for monitoring when a run starts. Add Product
+starts that run after saving; inclusion alone for existing or imported products
+does not place an order.
+
+Grouped paste input uses optional headings ending in `:` and either `Name: URL`
+or bare URL product lines. Missing `https://` is added before preview:
 
 ```text
 30th Celebration:
@@ -119,13 +200,16 @@ Poster Collection: https://www.target.com/p/example/-/A-1010892067
 
 Other:
 Future item: example.com/products/future
+
+https://www.target.com/p/-/A-1010892069
 ```
 
-The preview is shown before the interactive import requires one product mode
-and asks for armed state. Unsupported retailer URLs can be stored for future
-adapters, but they cannot be armed or run.
+The preview is shown before the interactive import requires one product mode.
+Imported products are included automatically. Unsupported retailer URLs can be
+stored for future adapters, but they cannot be included or run.
 Paste may contain blank separators between groups. Use F2 to preview the
-multiline import, then select its required mode and armed state before saving.
+multiline import, then select its required mode and inclusion state before
+saving.
 
 ### Direct commands
 
@@ -144,7 +228,8 @@ pokemon secrets set target.pin "<value>"
 pokemon secrets set discord.webhook-url "<value>"
 pokemon secrets show
 pokemon secrets clear target.pin
-pokemon add --name "Elite Trainer Box" --group "30th Celebration" --url "howl.link/99668grkawccg" --mode preorder
+pokemon add --url "howl.link/99668grkawccg" --mode preorder
+pokemon add --group "30th Celebration" --url "https://www.target.com/p/-/A-1010892067" --mode preorder
 pokemon import --file ".\products.txt" --mode buy --disarmed
 Get-Content ".\products.txt" | pokemon import --mode buy-now --armed
 pokemon edit abc123 --name "Updated name" --mode buy
@@ -157,8 +242,9 @@ pokemon monitor --execution live-purchase
 pokemon monitor --execution observe-only --no-solver
 ```
 
-`enable`/`disable` are aliases for `arm`/`disarm`, and `run` is an alias for
-`monitor`. Direct import requires `--mode buy-now`, `--mode preorder`, or
+`arm`/`disarm` (and their `enable`/`disable` aliases) are the compatibility
+command names for including or excluding products from a run. `run` is an alias
+for `monitor`. Direct import requires `--mode buy-now`, `--mode preorder`, or
 `--mode buy` and reads either `--file` or piped stdin. Target runs enable the
 bundled `./target-challenge-solver.js` by default. Use `--no-solver` (or
 `--no-challenge-solver`) to disable it; `--solver` and `--challenge-solver`
@@ -175,19 +261,23 @@ pokemon settings
 pokemon settings set target.<key> <value>
 ```
 
+The full-screen editor uses described choice menus for default run mode,
+expected fulfillment, browser driver, and challenge solver state. Numeric
+settings retain validated value entry because they accept ranges rather than a
+small fixed set of choices.
+
 | Key | Default | Validation |
 |---|---:|---|
 | `target.default-run-mode` | `stop-before-submit` | `observe`, `stop-before-submit`, or `live` |
-| `target.max-item-price` | `unset` | Positive decimal; required for active runs |
-| `target.max-order-total` | `unset` | Positive decimal; required for active runs |
+| `target.max-item-price` | `unset` | Optional positive decimal ceiling |
+| `target.max-order-total` | `unset` | Optional positive decimal ceiling |
 | `target.expected-fulfillment` | `unset` | `shipping`, `delivery`, `pickup`, `drive-up`, or `unset` |
 | `target.poll-interval-ms` | `5000` | Integer from `1500` through `1952257860` (jitter-safe Node timer maximum) |
 | `target.browser-driver` | `patchright` | `patchright` or `playwright` |
 | `target.solver-enabled` | `true` | Boolean |
 | `target.solve-attempts` | `3` | Integer, minimum `1` |
 | `target.settle-ms` | `1500` | Integer from `500` through `2147483647` |
-| `target.hold-ms` | `10000` | Integer from `100` through `15000` |
-| `target.timeout-ms` | `20000` | Integer from `1000` through `45000`, and at least hold plus `1000` |
+| `target.timeout-ms` | `20000` | Integer from `1000` through `45000`; per-attempt safety budget |
 | `target.challenge-backoff-ms` | `300000` | Integer from `60000` through `2147483647` |
 | `target.challenge-max-backoff-ms` | `1800000` | Integer through `2147483647`, and at least both base and cart-rate-limit backoffs |
 | `target.cart-rate-limit-backoff-ms` | `60000` | Integer from `60000` through `2147483647` |
@@ -198,8 +288,10 @@ Use `unset` for optional price or fulfillment values. The CLI maps these
 settings to the existing `TARGET_*` worker environment names. Existing
 challenge timing/attempt environment overrides remain higher-priority for
 compatibility; other non-sensitive worker values come from the catalog
-settings. Inherited overrides are validated against the same limits and
-cross-setting relationships before the worker starts.
+settings. Inherited overrides are validated against the same limits before the
+worker starts. The bundled solver has no fixed hold-duration setting: it keeps
+the native pointer down while the challenge remains present and releases when
+independent readable page evidence clears or the per-attempt timeout expires.
 
 ### Local secrets
 
@@ -244,32 +336,31 @@ Execution modes, selectable per run or through
   Place order.
 - `live-purchase`: leaves both gates unset and can submit a real order.
 
-Full-screen engine setup exposes bundled Target Press & Hold recovery and
+The TUI run setup exposes bundled Target Press & Hold recovery and
 defaults to the persisted `target.solver-enabled` setting, initially **yes**.
 The CLI sets `TARGET_CHALLENGE_SOLVER` to
 `./target-challenge-solver.js`; disabling recovery removes both that setting and
 `TARGET_CHALLENGE_VALIDATE` from the child environment. Existing
 `TARGET_CHALLENGE_SOLVE_ATTEMPTS`, `TARGET_CHALLENGE_SETTLE_MS`,
-`TARGET_CHALLENGE_HOLD_MS`, `TARGET_CHALLENGE_TIMEOUT_MS`, and challenge-backoff
-overrides are inherited unchanged. Solver input, independent clearance
+`TARGET_CHALLENGE_TIMEOUT_MS`, and challenge-backoff overrides are inherited
+unchanged. Solver input, independent clearance
 verification, mutation serialization, stale-state invalidation, and backoff
 remain owned by `target-watch.js` and the existing challenge modules.
 
-Active modes validate that the stored `target.max-item-price` and
-`target.max-order-total` settings are configured and that the environment-only
-or locally stored `DISCORD_WEBHOOK_URL` secret is present before the Target
-worker is spawned. `TARGET_PIN` remains optional until Target actually requests
-it. Secret values are not printed during normal operation. All Target checkout
-validation and submission safeguards remain owned by `target-watch.js` and
-`target-checkout.js`.
+Active modes validate configured price ceilings and require an
+environment-provided or locally stored `DISCORD_WEBHOOK_URL` before the Target
+worker is spawned. Unset price ceilings remain unlimited. `TARGET_PIN` remains
+optional until Target actually requests it. Secret values are not printed
+during normal operation. All Target checkout validation and submission
+safeguards remain owned by `target-watch.js` and `target-checkout.js`.
 
-Target permits at most three armed catalog items. The catalog itself may contain
-unlimited disarmed products. Only one retailer adapter process runs at a time
+Target permits at most three included catalog items. The catalog itself may
+contain unlimited excluded products. Only one retailer adapter process runs at a time
 because all workers share the same Chrome profile, cart, payment state, and
 session. Press Ctrl+C to stop the active child process; the catalog records an
 `interrupted` terminal outcome.
 
-The compact list displays armed state, retailer, product mode, name, group,
+The compact list displays inclusion state, retailer, product mode, name, group,
 last status/time, and the raw URL. Windows Terminal receives an OSC 8 hyperlink
 while the URL text remains visible. Common statuses mean:
 
@@ -299,17 +390,36 @@ single-adapter execution do not require retailer-specific rewrites.
 
 ## Development harness (pi)
 
-The project-local [pi harness](./.pi/README.md) provides `/deals` for scoped planning, implementation, review, and follow-up fixes. It uses offline checks by default and does not launch workers, connect to CDP, or authorize purchases. See its guide for trust/setup, agent roles, and validation commands.
+The project-local [pi harness](./.pi/README.md) provides `/deals` for scoped
+planning, implementation, review, and follow-up fixes. It is the development
+mode, not the AI-agent operations path: it uses offline checks by default and
+does not launch workers, connect to CDP, or authorize purchases. See its guide
+for trust/setup, agent roles, and validation commands.
 
 ## Start Chrome for Playwright
 
-If your existing Chrome already exposes CDP on `127.0.0.1:9444`, reuse it; do not create a new profile or restart it just to run the worker. The Target URL watch opens its own product tabs in that existing context and retains its authentication/cookies.
+The full-screen TUI and direct `pokemon monitor`/`pokemon run` commands
+automatically reuse CDP at `127.0.0.1:9444` when available. If it is
+unavailable, they launch the persistent PokemonDeals Chrome profile, wait for
+CDP, and then start the worker. Sign in to this profile once; the normal
+personal Chrome profile is never copied or modified.
 
-Only when CDP is not already available, restart the intended Chrome profile with remote debugging enabled. Chrome must be completely closed before that startup step because startup-only CDP flags are ignored when another browser process for that profile is already running.
+Override the automatic launch paths only when your Chrome installation or
+profile differs from the Windows defaults:
+
+```powershell
+$env:POKEMON_CHROME_PATH = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+$env:POKEMON_CHROME_USER_DATA_DIR = "$env:LOCALAPPDATA\PokemonDeals\Chrome User Data"
+$env:POKEMON_CHROME_PROFILE_DIRECTORY = 'Default'
+```
+
+The dedicated profile does not conflict with a normal Chrome session. Standalone
+scripts such as `npm run target:watch` still require the documented manual CDP
+startup because they do not run through the deals engine.
 
 ```powershell
 $chrome = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
-$userData = "$env:LOCALAPPDATA\Google\Chrome\User Data"
+$userData = "$env:LOCALAPPDATA\PokemonDeals\Chrome User Data"
 
 Start-Process -FilePath $chrome -ArgumentList `
   "--user-data-dir=$userData", `
@@ -360,7 +470,7 @@ The URL watch worker:
 9. Preserves the existing cart handshake, `Item not added to cart` ordering, challenge handling, and shared cart-rate-limit pause behavior. If cart input may have been sent but the result is uncertain, the owning product remains exclusive and reconciles before another purchase action can run.
 10. Tracks checkout progress with bounded recovery. Sign-in, payment-setup, unavailable-item, empty-cart, unexpected-cart, exhausted recovery, and disappearing Buy-now-panel states stop fail closed. It does not configure accounts, addresses, or payment methods.
 11. Reacquires replaced high-demand, shipping, and PIN controls from a fresh snapshot. High-demand and Place-order checks retain the 500 ms human-scale wait.
-12. Before the only permitted Place-order click, validates exactly one expected TCIN, quantity one, a detected fulfillment method (and configured match), one unambiguous item price, one unambiguous order total, and both configured maximums. The same validator applies to cart checkout and Buy now.
+12. Before the only permitted Place-order click, validates exactly one expected TCIN, quantity one, a detected fulfillment method (and configured match), one unambiguous item price, one unambiguous order total, and any configured maximums. The same validator applies to cart checkout and Buy now.
 13. If Place order may have been sent but confirmation is not explicit, the checkout stops as ambiguous and does not click Place order again.
 14. Observes Target's `cart_items` mutation and cart-reconciliation responses around each Add-to-cart/Preorder click instead of relying only on a fixed DOM delay. It logs status and elapsed time without persisting request bodies, headers, cookies, or keys.
 15. Treats any cart-service 429 as the existing shared-session circuit breaker and preserves the existing challenge-recovery contract.
@@ -368,8 +478,8 @@ The URL watch worker:
 Purchase configuration:
 
 - `TARGET_PIN`: required at runtime if Target asks for the debit-card PIN. Keep it only in the process environment.
-- `TARGET_MAX_ITEM_PRICE`: required for active purchasing; positive decimal maximum for the single expected item.
-- `TARGET_MAX_ORDER_TOTAL`: required for active purchasing; positive decimal maximum for the complete order.
+- `TARGET_MAX_ITEM_PRICE`: optional positive decimal maximum for the single expected item.
+- `TARGET_MAX_ORDER_TOTAL`: optional positive decimal maximum for the complete order.
 - `TARGET_EXPECTED_FULFILLMENT`: optional exact guard: `shipping`, `delivery`, `pickup`, or `drive-up`. Fulfillment must still be detected when this is unset.
 
 Optional controls:
@@ -383,11 +493,12 @@ Optional controls:
 - `TARGET_DOM_REFRESH_EVERY`: refresh the product page after this many API polls; default `20`.
 - `TARGET_CHALLENGE_BACKOFF_MS`: initial challenge cooldown; default `300000`.
 - `TARGET_CHALLENGE_MAX_BACKOFF_MS`: maximum exponential cooldown; default `1800000`.
+  Unreadable page-state retries use the base cooldown so product controls can
+  be checked again; network and cart-rate-limit backoff remains exponential.
 - `TARGET_CHALLENGE_SOLVER`: path or package name of a pluggable challenge solver module exporting `solveChallenge(context)`. When unset, a detected challenge only pauses the monitor. See `TARGET-CHALLENGE-SOLVER-HANDOVER.md`.
 - `TARGET_CHALLENGE_SOLVE_ATTEMPTS`: maximum solve attempts per challenge; default `3`. Attempts run consecutively within one recovery cycle; the backoff ladder applies after that cycle fails, not between every attempt. The bundled solver does not automatically refresh between attempts.
 - `TARGET_CHALLENGE_SETTLE_MS`: wait before re-verifying the page after each normally completed solve attempt; default `1500`. Thrown attempts are retried without this wait.
-- `TARGET_CHALLENGE_HOLD_MS`: bundled solver's maximum continuous hold; default `10000`, integer range `100`–`15000`. It releases early when the held control disappears.
-- `TARGET_CHALLENGE_TIMEOUT_MS`: bundled solver's per-attempt action budget; default `20000`, integer range `1000`–`45000`, at least the hold duration plus `1000`. Cleanup has up to `1000` ms for release and `500` ms for handle disposal beyond this budget. A lost browser connection can prevent release; that attempt fails closed.
+- `TARGET_CHALLENGE_TIMEOUT_MS`: bundled solver's per-attempt safety budget; default `20000`, integer range `1000`–`45000`. The solver keeps the native pointer down until readable clearance evidence appears, the control disappears, or this budget expires. Cleanup has up to `1000` ms for release and `500` ms for handle disposal beyond the budget. A lost browser connection can prevent release; that attempt fails closed.
 - `TARGET_CHALLENGE_VALIDATE`: set to `1` only with observe-only mode and a configured solver to allow an API challenge to recover and polling to resume. Unresolved challenges and unrelated HTTP/fetch/parse errors still stop the run; success never overrides poll/time limits.
 - `TARGET_MONITOR_MAX_RUNTIME_MS`: optional runtime limit, default `0` (unlimited). Checked between operations; an in-flight navigation/solve may finish after this deadline.
 - `TARGET_MONITOR_KEEP_PAGE`: set to `1` in observe-only mode to preserve diagnostic tabs when the monitor exits normally. No input or monitoring continues after exit.
@@ -433,9 +544,9 @@ supported. Generic CAPTCHA/access-denied pages, ambiguous controls, and
 unreadable states are not treated as solved. It does not use test tokens, alter
 cookies, synthesize DOM events, or delete challenge markup. Frame discovery
 checks the browser-native frame tree and ancestor visibility to exclude hidden
-copies. After releasing input it waits for live clearance within the remaining
-`TARGET_CHALLENGE_TIMEOUT_MS` budget, not merely for the button label to
-disappear; the driver then independently verifies again.
+copies. While input remains held, it waits for readable live clearance within
+the `TARGET_CHALLENGE_TIMEOUT_MS` budget, not merely for the button label to
+disappear; it releases and the driver independently verifies again.
 
 For operational verification, use the existing authenticated CDP profile without changing its user agent, cookies, or automation flags. Separate profiles and unusual browser settings were used only for the recorded trigger experiments; they are not required by the solver and do not isolate IP reputation.
 
@@ -575,7 +686,8 @@ conservative to reduce Target verification triggers.
 
 The deduplicated Pokémon Center catalog is recorded in
 [`data/pokemoncenter-products.json`](./data/pokemoncenter-products.json).
-Run the monitor with the authenticated Chrome profile:
+Run the standalone monitor after manually starting the dedicated PokemonDeals
+Chrome profile with CDP enabled:
 
 ```powershell
 Set-Location 'F:\Repos\personal\temp\PokemonDeals'
