@@ -84,6 +84,7 @@ npm run target:checkout
 npm run target:watch
 npm run target:preorder
 npm run pokemoncenter:preorder
+npm run amazon:direct-buy
 npm run amazon:preorder
 npm run amazon:multi-preorder
 npm run amazon:checkout
@@ -96,6 +97,12 @@ orders; `target:preorder` is the cart-monitoring step. Follow the
 environment-variable setup and safety checks in `README.md` before invoking any
 worker.
 
+The repository skill `.github/skills/amazon-buy/SKILL.md` supports
+`/amazon-buy <Amazon product or direct Buy Now URL>`. That invocation
+authorizes exactly one quantity-one Amazon order and launches the
+single-product direct-buy worker with the documented `$10000` fail-safe
+ceilings.
+
 ## Architecture
 
 - **Shared browser runtime:** Every worker calls `chromium.connectOverCDP("http://127.0.0.1:9444")`, uses the first existing browser context, and opens its own page. The deals engine bootstraps the persistent non-default PokemonDeals Chrome profile when needed; the outer loop reconnects when Chrome or a page is unavailable.
@@ -103,7 +110,7 @@ worker.
 - **Target checkout (`monitor.js`):** A page-local state machine handles `/cart` redirects, manual verification pauses, high-demand dialogs, shipping `Save and continue`, the `TARGET_PIN` confirmation dialog, and repeated order attempts. It exits only after explicit order-confirmation text or URL evidence.
 - **Target preorder (`preorder.js`):** The configured Target product IDs are monitored in one reusable tab per product, with a stagger between pages. `PRODUCT_FILTER` narrows the set. A product tab closes after a cart-add signal; verification pauses only the affected tab, and reconnect cleanup closes the active batch before new tabs are created.
 - **Pokémon Center (`pokemoncenter-preorder.js`):** The deduplicated catalog uses one reusable tab per product. Product actions are serialized through the shared Pokémon Center cart; the worker validates product identity and order total, pauses for manual verification/sign-in, and stops after explicit confirmation.
-- **Amazon preorder (`amazon-preorder.js`):** The flow validates the expected ASIN/title, accepts only an Amazon-shipped and Amazon-sold offer under the configured item-price limit, selects only the expected cart item, enforces an order-total limit, and then proceeds through checkout.
+- **Amazon direct buy (`amazon-preorder.js`):** The flow accepts a `/dp/ASIN`, `/gp/product/ASIN`, or `/checkout/entry/buynow` URL, validates the expected ASIN/title, and monitors for an Amazon-shipped and Amazon-sold offer under the configured item-price limit. A supplied checkout offer token is used only when it matches the verified current Amazon offer; otherwise the worker derives a replacement token. It enters Buy Now checkout without adding to cart, refreshes unavailable checkout states while periodically reacquiring rotated tokens, enforces an order-total limit, clicks Place order at most once, and stops only on explicit confirmation. `amazon:preorder` remains an alias for `amazon:direct-buy`.
 - **Amazon checkout (`amazon-checkout.js`):** The current transient checkout URL comes from `AMAZON_CHECKOUT_URL`. The worker refreshes while Amazon reports quantity/update errors, clicks `Continue` when needed, submits when checkout is usable, and then waits for explicit confirmation evidence.
 - **Experimental Target variant:** `monitor_with_captcha_simulation.js` is syntax-checked but is not an exposed npm workflow.
 

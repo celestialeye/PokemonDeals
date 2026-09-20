@@ -255,7 +255,7 @@ Very aggressive refresh and click loops coincided with repeated retailer verific
 
 - Target checkout: wait up to 1 second for actionable content, then wait 1 second before a reload when no action is available.
 - Target preorder: wait up to 3 seconds for Preorder and 5 seconds after clicking.
-- Amazon checkout: refresh once per second while the item-quantity error remains.
+- Amazon checkout: refresh once per second while quantity, update, or unavailable-item errors remain.
 
 Verification is detected through URL, title, and body-text patterns. The legacy
 workers pause CAPTCHA, robot-check, Press and hold, and access-denied pages for
@@ -586,6 +586,63 @@ passing report was validated with assertions for event ordering, balanced input,
 request-template reset, two valid 200 responses, concurrency one, and zero purchase
 or observed cart-mutation activity.
 
+## Amazon direct-buy offer discovery
+
+The single-product Amazon worker accepts `/dp/ASIN`, `/gp/product/ASIN`, or a
+validated `/checkout/entry/buynow` URL. For a supplied checkout URL, it derives
+the product page from the ASIN and uses the supplied offer token only when that
+token matches a current qualifying Amazon offer. It reads the active Buy Box
+first, then See All Buying Options or the offer-listing page when needed. A
+candidate must match the expected ASIN, be both sold by and shipped from Amazon,
+expose an enabled purchase control and current offer token, and stay within the
+configured item price limit.
+
+The worker builds the direct Buy Now checkout URL from that current token and
+does not add the item to the cart. While checkout reports quantity, update, or
+unavailable-item errors, it retries that URL once per second. Every ten such
+responses it revisits offer discovery and switches to a newly issued qualifying
+token when one is available. Final submission still requires expected-product
+evidence and an order total within the configured limit. Place order is clicked
+at most once per run; a nonconfirmed post-click result is terminal and ambiguous.
+If Amazon presents an explicit recent-purchase or duplicate-order warning, the
+worker may select its affirmative consent and click one order-anyway confirmation.
+That exception is gated by duplicate-warning text and cannot reopen the ordinary
+Place order path.
+
+Read-only inspection on 2026-09-19 confirmed both sides of the discovery guard:
+
+- `B071V91LGC` exposed an enabled Buy Now control and offer token at `$29.99`,
+  but the Buy Box was shipped by Amazon and sold by Vault X Ltd, so it must be
+  rejected.
+- `B0007VO0DU` exposed an enabled Buy Now control, matching ASIN, current offer
+  token, `$26.99` price, and `Shipper / Seller Amazon.com`, so it is a qualifying
+  direct-buy candidate.
+- `B0GW2DK37Q` later exposed the same qualifying field structure at `$26.87`.
+
+These inspections did not enter checkout, mutate a cart, or submit an order.
+Offer tokens were not persisted.
+
+The repository-level `/amazon-buy <amazon-url>` skill is the operator entry
+point for this single-product flow. It accepts a product URL or a direct Buy Now
+URL containing one ASIN, offer token, `quantity=1`, and `buyNow=1`. A supplied
+checkout token is used only after it matches a current qualifying Amazon-sold
+and Amazon-shipped offer; a stale or different token is replaced with a newly
+verified offer. Invocation authorizes one quantity-one order, uses the
+user-approved `$10000` item and order-total fail-safe ceilings, ignores
+return-policy text, refuses third-party offers, and does not expose supplied or
+generated checkout URLs. Its launcher reuses the authenticated CDP endpoint
+when available and otherwise restarts the documented authenticated Default
+Chrome profile with CDP enabled. It fails closed if another Amazon purchase
+worker is already running.
+
+Amazon purchase workers now tee their event stream to timestamped JSONL files
+under the gitignored `logs/` directory. The `/amazon-buy` launcher records its
+mutex, dependency, CDP, worker-start, exit, and failure milestones in the same
+file. Worker output records offer discovery, retries, refreshed tokens,
+verification/sign-in pauses, duplicate confirmation, submission, and terminal
+results. Checkout URLs, offer tokens, order IDs, authorization values, cookies,
+and session tokens are redacted; page bodies and account details are excluded.
+
 ## Amazon checkout state machine
 
 Amazon checkout URLs contain transient execution identifiers and can change during the flow. The current URL must be passed through `AMAZON_CHECKOUT_URL`.
@@ -593,7 +650,7 @@ Amazon checkout URLs contain transient execution identifiers and can change duri
 The worker:
 
 1. Opens the supplied checkout URL.
-2. Detects Make updates to your items and quantity-unavailable messages.
+2. Detects Make updates to your items, quantity-unavailable messages, and unavailable-from-selected-seller messages.
 3. Refreshes while those errors remain.
 4. Treats navigation aborts caused by Amazon redirects as recoverable.
 5. Clicks Continue after the item-selection error clears.

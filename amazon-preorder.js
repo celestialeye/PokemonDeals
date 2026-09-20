@@ -1,30 +1,58 @@
 const { chromium } = require("playwright-core");
+const { installAmazonRunLogger } = require("./src/amazon-run-log");
 const {
-  navigateToCart,
-  waitForExpectedCartItemCount,
-} = require("./src/amazon-cart");
+  confirmAmazonDuplicateOrder,
+  isAmazonDuplicateOrderWarning,
+  isAmazonOrderConfirmed,
+  isAmazonSignInRequired,
+  isAmazonVerificationRequired,
+  isUnavailableCheckoutText,
+  sanitizeAmazonError,
+} = require("./amazon-checkout");
 const {
+  amazonOfferListingIdsMatch,
+  buildDirectBuyUrl,
   buildOfferListingUrl,
   isQualifyingAmazonOffer,
+  offerAsinSelector,
   offerAddToCartSelector,
   offerContainerSelector,
+  offerListingIdSelector,
+  parseAmazonCheckoutUrl,
+  parseAmazonProductUrl,
+  parseOfferPrice,
 } = require("./src/amazon-offers");
 
 const endpoint = "http://127.0.0.1:9444";
-const productUrl = process.env.AMAZON_PRODUCT_URL;
+const configuredProductUrl = process.env.AMAZON_PRODUCT_URL;
+const configuredCheckoutUrl = process.env.AMAZON_CHECKOUT_URL;
+const parsedProduct = configuredProductUrl
+  ? parseAmazonProductUrl(configuredProductUrl)
+  : null;
+const parsedCheckout = configuredCheckoutUrl
+  ? parseAmazonCheckoutUrl(configuredCheckoutUrl)
+  : null;
+const inputAsin = parsedProduct?.asin || parsedCheckout?.asin;
+const productUrl =
+  parsedProduct?.url ||
+  (parsedCheckout
+    ? `https://www.amazon.com/dp/${parsedCheckout.asin}`
+    : null);
+const suppliedCheckoutUrl = parsedCheckout?.url || null;
+const suppliedOfferListingId = parsedCheckout?.offerListingId || null;
+const inputUrl = parsedProduct?.url || parsedCheckout?.url;
+const associateTag = inputUrl
+  ? new URL(inputUrl).searchParams.get("tag")
+  : null;
 const expectedAsin =
-  process.env.AMAZON_EXPECTED_ASIN ||
-  productUrl?.match(/\/dp\/([A-Z0-9]{10})/i)?.[1]?.toUpperCase();
+  process.env.AMAZON_EXPECTED_ASIN?.trim().toUpperCase() || inputAsin;
 const expectedTitle = process.env.AMAZON_EXPECTED_TITLE || "";
 const retryDelayMs = Number(process.env.AMAZON_RETRY_DELAY_MS || 2000);
 const maxItemPrice = Number(process.env.AMAZON_MAX_ITEM_PRICE || 30);
 const maxOrderTotal = Number(process.env.AMAZON_MAX_ORDER_TOTAL || 40);
-const unavailablePattern =
-  /this item is currently unavailable|items? you selected (?:are|is) not available|item .* is no longer available from the seller you selected|items out of stock/i;
-const verificationPattern =
-  /verify (?:that )?you(?:'re| are) human|captcha|not a robot|robot check|enter the characters you see/i;
-const confirmationPattern =
-  /thank you,? your order has been placed|order placed|order number/i;
+const checkoutRetryDelayMs = 1000;
+const offerRecheckInterval = 10;
+const postSubmitConfirmationTimeoutMs = 60000;
 
 async function readBody(page) {
   return page.locator("body").innerText().catch(() => "");
@@ -38,11 +66,6 @@ async function isReady(locator) {
   );
 }
 
-function parsePrice(text) {
-  const match = text.match(/\$([\d,]+(?:\.\d{2})?)/);
-  return match ? Number(match[1].replace(/,/g, "")) : null;
-}
-
 function parseOrderTotal(text) {
   const match = text
     .replace(/\s+/g, " ")
@@ -50,20 +73,76 @@ function parseOrderTotal(text) {
   return match ? Number(match[1].replace(/,/g, "")) : null;
 }
 
-async function getDirectOffer(page) {
-  const buyBox = page.locator("#desktop_buybox, #buybox").first();
-  const text = (await buyBox.innerText().catch(() => "")).replace(/\s+/g, " ");
-  const soldByAmazon =
-    /sold by\s+amazon(?:\.com)?(?: services llc)?(?:\s|$)/i.test(text) ||
-    /shipper\s*\/\s*seller\s+amazon(?:\.com)?(?:\s|$)/i.test(text);
-  const shipsFromAmazon =
-    /ships from\s+amazon(?:\.com)?(?: services llc)?(?:\s|$)/i.test(text) ||
-    /shipper\s*\/\s*seller\s+amazon(?:\.com)?(?:\s|$)/i.test(text);
+function hasVerifiedDirectCheckoutIdentity({
+  activeCheckoutUrl,
+  activeOfferAsin,
+  activeOfferListingId,
+  expectedAsin: requiredAsin,
+}) {
+  return (
+    Boolean(activeCheckoutUrl) &&
+    Boolean(activeOfferListingId) &&
+    activeOfferAsin === requiredAsin
+  );
+}
+
+function resolveVerifiedCheckoutUrl({
+  asin,
+  offerListingId,
+  tag,
+  suppliedUrl,
+  suppliedListingId,
+}) {
+  const usesSuppliedUrl =
+    Boolean(suppliedUrl) &&
+    amazonOfferListingIdsMatch(offerListingId, suppliedListingId);
 
   return {
-    price: parsePrice(text),
-    soldByAmazon,
-    shipsFromAmazon,
+    url: usesSuppliedUrl
+      ? suppliedUrl
+      : buildDirectBuyUrl(asin, offerListingId, { tag }),
+    usesSuppliedUrl,
+  };
+}
+
+async function readFirstInputValue(scope, selector) {
+  const inputs = scope.locator(selector);
+  for (let index = 0; index < (await inputs.count()); index += 1) {
+    const value = (await inputs.nth(index).inputValue().catch(() => "")).trim();
+    if (value) {
+      return value;
+    }
+  }
+  return null;
+}
+
+async function getDirectOffer(page) {
+  const buyBox = page.locator("#desktop_buybox, #buybox").first();
+  if ((await buyBox.count()) === 0) {
+    return null;
+  }
+
+  const text = (await buyBox.innerText().catch(() => "")).replace(/\s+/g, " ");
+  const purchaseControl = buyBox
+    .getByRole("button", {
+      name: /^(?:buy now|pre-order now|add to cart)$/i,
+    })
+    .first();
+  const offerAsin = (
+    (await readFirstInputValue(buyBox, offerAsinSelector)) || ""
+  ).toUpperCase();
+  const offerListingId = await readFirstInputValue(
+    buyBox,
+    offerListingIdSelector,
+  );
+
+  return {
+    actionable: await isReady(purchaseControl),
+    asin: offerAsin,
+    offerListingId,
+    price: parseOfferPrice(text),
+    qualifying: isQualifyingAmazonOffer(text, maxItemPrice),
+    source: "buy-box",
   };
 }
 
@@ -81,48 +160,23 @@ async function containsExpectedProduct(page, bodyText = "") {
   return expectedTitle.length > 0 && bodyText.includes(expectedTitle);
 }
 
-async function selectOnlyExpectedCartItem(page) {
-  if (!/\/(?:gp\/cart|cart)\b/i.test(page.url())) {
-    return true;
-  }
-
-  const activeCart = page.locator("#sc-active-cart");
-  const expectedItem = activeCart
-    .locator(`.sc-list-item[data-asin="${expectedAsin}"]`)
-    .first();
-  if (
-    (await waitForExpectedCartItemCount(() => expectedItem.count())) === 0
-  ) {
-    console.log("AMAZON_CART_PRODUCT_MISMATCH - expected ASIN is not in cart");
-    return false;
-  }
-
-  const items = activeCart.locator(".sc-list-item[data-asin]");
-  for (let index = 0; index < (await items.count()); index += 1) {
-    const item = items.nth(index);
-    const asin = (await item.getAttribute("data-asin"))?.toUpperCase();
-    const checkbox = item.locator('input[type="checkbox"]').first();
-    if ((await checkbox.count()) === 0) {
-      continue;
-    }
-
-    if (asin === expectedAsin) {
-      await checkbox.check({ force: true }).catch(() => {});
-    } else {
-      await checkbox.uncheck({ force: true }).catch(() => {});
-    }
-  }
-
-  return true;
-}
-
-async function selectAmazonBuyingOption(page) {
+async function findAmazonBuyingOption(page) {
   const seeAllBuyingOptions = page
     .getByRole("link", { name: /see all buying options/i })
     .first();
 
   if (await isReady(seeAllBuyingOptions)) {
-    await seeAllBuyingOptions.click({ timeout: 5000 });
+    const href = await seeAllBuyingOptions.getAttribute("href");
+    if (href) {
+      await page
+        .goto(new URL(href, page.url()).href, {
+          waitUntil: "domcontentloaded",
+          timeout: 15000,
+        })
+        .catch(() => {});
+    } else {
+      await seeAllBuyingOptions.click({ timeout: 5000 }).catch(() => {});
+    }
     await page
       .locator("#aod-offer-list")
       .waitFor({ timeout: 5000 })
@@ -151,31 +205,63 @@ async function selectAmazonBuyingOption(page) {
     }
 
     const addToCart = offer.locator(offerAddToCartSelector).first();
-    if (await isReady(addToCart)) {
-      const price = parsePrice(offerText);
-      await addToCart.click({ timeout: 5000 });
-      console.log(
-        `AMAZON_OFFER_ADDED - Amazon seller at $${price.toFixed(2)}`,
-      );
-      await page.waitForTimeout(1000);
-      if (/\/(?:dp|gp\/offer-listing)\//i.test(page.url())) {
-        await navigateToCart(page);
-      }
-      return true;
+    const offerAsin = (
+      (await readFirstInputValue(offer, offerAsinSelector)) || ""
+    ).toUpperCase();
+    const offerListingId = await readFirstInputValue(
+      offer,
+      offerListingIdSelector,
+    );
+    if (
+      offerAsin === expectedAsin &&
+      offerListingId &&
+      (await isReady(addToCart))
+    ) {
+      return {
+        asin: offerAsin,
+        offerListingId,
+        price: parseOfferPrice(offerText),
+        source: "buying-options",
+      };
     }
   }
 
-  console.log("AMAZON_OFFER_NOT_FOUND - refreshing");
-  return false;
+  return null;
+}
+
+async function findAmazonDirectBuyOffer(page) {
+  const directOffer = await getDirectOffer(page);
+  if (
+    directOffer?.actionable &&
+    directOffer.asin === expectedAsin &&
+    directOffer.offerListingId &&
+    directOffer.qualifying
+  ) {
+    return directOffer;
+  }
+
+  return findAmazonBuyingOption(page);
 }
 
 async function main() {
-  if (!productUrl) {
-    throw new Error("AMAZON_PRODUCT_URL is required.");
+  if (!configuredProductUrl && !configuredCheckoutUrl) {
+    throw new Error(
+      "AMAZON_PRODUCT_URL or AMAZON_CHECKOUT_URL is required.",
+    );
+  }
+  if (configuredProductUrl && configuredCheckoutUrl) {
+    throw new Error(
+      "Set exactly one of AMAZON_PRODUCT_URL or AMAZON_CHECKOUT_URL.",
+    );
   }
   if (!expectedAsin) {
     throw new Error(
-      "AMAZON_EXPECTED_ASIN is required when it cannot be read from AMAZON_PRODUCT_URL.",
+      "AMAZON_EXPECTED_ASIN is required when it cannot be read from the configured Amazon URL.",
+    );
+  }
+  if (inputAsin !== expectedAsin) {
+    throw new Error(
+      "AMAZON_EXPECTED_ASIN does not match the configured Amazon URL.",
     );
   }
   if (!Number.isFinite(retryDelayMs) || retryDelayMs < 1000) {
@@ -184,21 +270,41 @@ async function main() {
   if (!Number.isFinite(maxItemPrice) || maxItemPrice <= 0) {
     throw new Error("AMAZON_MAX_ITEM_PRICE must be greater than zero.");
   }
-  if (!Number.isFinite(maxOrderTotal) || maxOrderTotal <= maxItemPrice) {
-    throw new Error(
-      "AMAZON_MAX_ORDER_TOTAL must be greater than AMAZON_MAX_ITEM_PRICE.",
-    );
+  if (!Number.isFinite(maxOrderTotal) || maxOrderTotal <= 0) {
+    throw new Error("AMAZON_MAX_ORDER_TOTAL must be greater than zero.");
   }
 
+  installAmazonRunLogger({
+    workflow: "amazon-direct-buy",
+    metadata: {
+      asin: expectedAsin,
+      quantity: 1,
+    },
+  });
+
   let attempts = 0;
+  let checkoutRefreshes = 0;
+  let activeCheckoutUrl = null;
+  let activeOfferAsin = null;
+  let activeOfferListingId = null;
   let verificationActive = false;
+  let signInActive = false;
+  let submissionAttempted = false;
+  let submissionAttemptedAt = 0;
+  let submissionGuardsValidated = false;
+  let submissionPage = null;
+  let duplicateConfirmationAttempted = false;
+  let suppliedCheckoutDispositionLogged = false;
 
   while (true) {
     try {
       const browser = await chromium.connectOverCDP(endpoint, { timeout: 3000 });
       const context = browser.contexts()[0];
+      if (!context) {
+        throw new Error("No authenticated Chrome context is available.");
+      }
       const page = await context.newPage();
-      await page.goto(productUrl, {
+      await page.goto(activeCheckoutUrl || productUrl, {
         waitUntil: "domcontentloaded",
         timeout: 20000,
       });
@@ -210,9 +316,10 @@ async function main() {
         await page.waitForTimeout(1000);
 
         const bodyText = await readBody(page);
-        const verificationVisible =
-          verificationPattern.test(bodyText) ||
-          /captcha|validatecaptcha/i.test(page.url());
+        const verificationVisible = isAmazonVerificationRequired(
+          page.url(),
+          bodyText,
+        );
 
         if (verificationVisible) {
           if (!verificationActive) {
@@ -227,33 +334,133 @@ async function main() {
           verificationActive = false;
         }
 
-        if (confirmationPattern.test(bodyText)) {
-          console.log("AMAZON_PREORDER_CONFIRMED");
+        const signInVisible = isAmazonSignInRequired(page.url(), bodyText);
+        if (signInVisible) {
+          if (!signInActive) {
+            console.log("AMAZON_SIGN_IN_REQUIRED - waiting");
+            signInActive = true;
+          }
+          await page.waitForTimeout(1000);
+          continue;
+        }
+        if (signInActive) {
+          console.log("AMAZON_SIGN_IN_CLEARED - resuming");
+          signInActive = false;
+        }
+
+        if (
+          submissionAttempted &&
+          isAmazonOrderConfirmed(page.url(), bodyText)
+        ) {
+          console.log("AMAZON_ORDER_CONFIRMED");
           process.exit(0);
         }
 
-        const unavailable =
-          unavailablePattern.test(bodyText) ||
-          /\/checkout\/entry\/oos/i.test(page.url());
-        if (unavailable) {
-          const goBack = page.getByRole("button", { name: /^go back$/i }).first();
-          if (await isReady(goBack)) {
-            await goBack.click({ timeout: 5000 }).catch(() => {});
-            console.log("AMAZON_UNAVAILABLE_GO_BACK");
-            await page.waitForTimeout(retryDelayMs);
+        if (
+          submissionAttempted &&
+          submissionPage === page &&
+          submissionGuardsValidated &&
+          !duplicateConfirmationAttempted &&
+          isAmazonDuplicateOrderWarning(bodyText)
+        ) {
+          try {
+            const duplicateConfirmed = await confirmAmazonDuplicateOrder(
+              page,
+              bodyText,
+              {
+                beforeClick: () => {
+                  duplicateConfirmationAttempted = true;
+                  submissionAttemptedAt = Date.now();
+                },
+                guardsValidated: true,
+                submissionAttempted: true,
+              },
+            );
+            if (duplicateConfirmed) {
+              console.log("AMAZON_DUPLICATE_ORDER_CONFIRMED");
+              await page.waitForTimeout(1000);
+              continue;
+            }
+          } catch (error) {
+            console.error(
+              `AMAZON_DUPLICATE_ORDER_CONFIRMATION_AMBIGUOUS ${sanitizeAmazonError(error)}`,
+            );
+            process.exit(1);
           }
+        }
 
+        if (submissionAttempted) {
           if (
-            unavailablePattern.test(await readBody(page)) ||
-            /\/checkout\/entry\/oos/i.test(page.url())
+            Date.now() - submissionAttemptedAt >=
+            postSubmitConfirmationTimeoutMs
           ) {
+            console.error(
+              "AMAZON_ORDER_CONFIRMATION_AMBIGUOUS - stopping to avoid a duplicate submission",
+            );
+            process.exit(1);
+          }
+          await page.waitForTimeout(1000);
+          continue;
+        }
+
+        const outOfStockCheckout = /\/checkout\/entry\/oos/i.test(page.url());
+        const onCheckoutPage =
+          /amazon\.com\/checkout/i.test(page.url()) || outOfStockCheckout;
+        const unavailable =
+          outOfStockCheckout ||
+          (onCheckoutPage && isUnavailableCheckoutText(bodyText));
+        if (unavailable) {
+          if (!activeCheckoutUrl) {
             await page
               .goto(productUrl, {
                 waitUntil: "domcontentloaded",
                 timeout: 15000,
               })
               .catch(() => {});
+            continue;
           }
+
+          checkoutRefreshes += 1;
+          if (checkoutRefreshes === 1 || checkoutRefreshes % 10 === 0) {
+            console.log(`AMAZON_CHECKOUT_REFRESH ${checkoutRefreshes}`);
+          }
+
+          if (checkoutRefreshes % offerRecheckInterval === 0) {
+            await page
+              .goto(productUrl, {
+                waitUntil: "domcontentloaded",
+                timeout: 15000,
+              })
+              .catch(() => {});
+
+            const refreshedOffer = await findAmazonDirectBuyOffer(page);
+            if (refreshedOffer) {
+              const refreshedCheckout = resolveVerifiedCheckoutUrl({
+                asin: expectedAsin,
+                offerListingId: refreshedOffer.offerListingId,
+                tag: associateTag,
+                suppliedUrl: suppliedCheckoutUrl,
+                suppliedListingId: suppliedOfferListingId,
+              });
+              if (refreshedOffer.offerListingId !== activeOfferListingId) {
+                console.log(
+                  `AMAZON_OFFER_TOKEN_REFRESHED - ${refreshedOffer.source} Amazon at $${refreshedOffer.price.toFixed(2)}`,
+                );
+                activeOfferAsin = refreshedOffer.asin;
+                activeOfferListingId = refreshedOffer.offerListingId;
+                activeCheckoutUrl = refreshedCheckout.url;
+                checkoutRefreshes = 0;
+              }
+            }
+          }
+
+          await page.waitForTimeout(checkoutRetryDelayMs);
+          await page
+            .goto(activeCheckoutUrl, {
+              waitUntil: "domcontentloaded",
+              timeout: 15000,
+            })
+            .catch(() => {});
           continue;
         }
 
@@ -261,7 +468,15 @@ async function main() {
           .getByRole("button", { name: /place (?:your )?order/i })
           .first();
         if (await isReady(placeOrder)) {
-          if (!(await containsExpectedProduct(page, bodyText))) {
+          const productIdentityVerified =
+            (await containsExpectedProduct(page, bodyText)) ||
+            hasVerifiedDirectCheckoutIdentity({
+              activeCheckoutUrl,
+              activeOfferAsin,
+              activeOfferListingId,
+              expectedAsin,
+            });
+          if (!productIdentityVerified) {
             console.log(
               "AMAZON_CHECKOUT_PRODUCT_MISMATCH - refusing to place order",
             );
@@ -281,21 +496,27 @@ async function main() {
             continue;
           }
           if (orderTotal > maxOrderTotal) {
-            throw new Error(
-              `Order total $${orderTotal.toFixed(2)} exceeds limit $${maxOrderTotal.toFixed(2)}.`,
+            console.error(
+              `AMAZON_ORDER_BLOCKED - total $${orderTotal.toFixed(2)} exceeds limit $${maxOrderTotal.toFixed(2)}`,
             );
+            process.exit(1);
           }
 
           console.log(`AMAZON_PLACE_ORDER_FOUND after ${attempts} attempts`);
-          await placeOrder.click({ timeout: 5000 });
+          submissionAttempted = true;
+          submissionAttemptedAt = Date.now();
+          submissionGuardsValidated = true;
+          submissionPage = page;
+          try {
+            await placeOrder.click({ timeout: 5000 });
+          } catch (error) {
+            console.error(
+              `AMAZON_ORDER_CONFIRMATION_AMBIGUOUS ${sanitizeAmazonError(error)}`,
+            );
+            process.exit(1);
+          }
           console.log("AMAZON_PLACE_ORDER_CLICKED");
-          await page
-            .waitForFunction(
-              (pattern) => new RegExp(pattern, "i").test(document.body?.innerText || ""),
-              confirmationPattern.source,
-              { timeout: 15000 },
-            )
-            .catch(() => {});
+          await page.waitForTimeout(1000);
           continue;
         }
 
@@ -309,90 +530,42 @@ async function main() {
           continue;
         }
 
-        const proceedToCheckout = page
-          .getByRole("button", { name: /proceed to checkout/i })
-          .or(page.getByRole("link", { name: /proceed to checkout/i }))
-          .first();
-        if (await isReady(proceedToCheckout)) {
-          const cartReady = await selectOnlyExpectedCartItem(page);
-          const currentBody = await readBody(page);
-          if (
-            !cartReady ||
-            !(await containsExpectedProduct(page, currentBody))
-          ) {
-            console.log(
-              "AMAZON_CART_PRODUCT_MISMATCH - refusing to enter checkout",
-            );
-            await page
-              .goto(productUrl, {
-                waitUntil: "domcontentloaded",
-                timeout: 15000,
-              })
-              .catch(() => {});
-            continue;
-          }
-
-          await proceedToCheckout.click({ timeout: 5000 }).catch(() => {});
-          console.log("AMAZON_PROCEED_TO_CHECKOUT_CLICKED");
-          await page.waitForTimeout(1000);
+        if (onCheckoutPage) {
+          await page.waitForTimeout(500);
           continue;
         }
 
-        const preorder = page
-          .getByRole("button", { name: /^pre-order now$/i })
-          .first();
-        if (await isReady(preorder)) {
-          if (!page.url().toUpperCase().includes(`/DP/${expectedAsin}`)) {
-            console.log(
-              "AMAZON_PRODUCT_PAGE_MISMATCH - refusing direct preorder",
-            );
-            await page
-              .goto(productUrl, {
-                waitUntil: "domcontentloaded",
-                timeout: 15000,
-              })
-              .catch(() => {});
-            continue;
-          }
-
-          const directOffer = await getDirectOffer(page);
-          const directOfferAllowed =
-            directOffer.shipsFromAmazon &&
-            directOffer.soldByAmazon &&
-            directOffer.price !== null &&
-            directOffer.price <= maxItemPrice;
-          if (!directOfferAllowed) {
-            attempts += 1;
-            if (attempts === 1 || attempts % 10 === 0) {
-              console.log(
-                `AMAZON_DIRECT_OFFER_REJECTED seller=${directOffer.soldByAmazon && directOffer.shipsFromAmazon ? "Amazon" : "other"} price=${directOffer.price ?? "unknown"}`,
-              );
-            }
-            await page.waitForTimeout(retryDelayMs);
-            await page
-              .goto(productUrl, {
-                waitUntil: "domcontentloaded",
-                timeout: 15000,
-              })
-              .catch(() => {});
-            continue;
-          }
-
+        const directOffer = await findAmazonDirectBuyOffer(page);
+        if (directOffer) {
           attempts += 1;
+          activeOfferAsin = directOffer.asin;
+          activeOfferListingId = directOffer.offerListingId;
+          const resolvedCheckout = resolveVerifiedCheckoutUrl({
+            asin: expectedAsin,
+            offerListingId: directOffer.offerListingId,
+            tag: associateTag,
+            suppliedUrl: suppliedCheckoutUrl,
+            suppliedListingId: suppliedOfferListingId,
+          });
+          activeCheckoutUrl = resolvedCheckout.url;
+          checkoutRefreshes = 0;
+          if (suppliedCheckoutUrl && !suppliedCheckoutDispositionLogged) {
+            console.log(
+              resolvedCheckout.usesSuppliedUrl
+                ? "AMAZON_SUPPLIED_CHECKOUT_VERIFIED"
+                : "AMAZON_SUPPLIED_CHECKOUT_REPLACED - using current qualifying Amazon offer",
+            );
+            suppliedCheckoutDispositionLogged = true;
+          }
           console.log(
-            `AMAZON_PREORDER_CLICK ${attempts} - Amazon at $${directOffer.price.toFixed(2)}`,
+            `AMAZON_DIRECT_CHECKOUT_FOUND ${attempts} - ${directOffer.source} Amazon at $${directOffer.price.toFixed(2)}`,
           );
-          await preorder.click({ timeout: 5000 }).catch(() => {});
-          await page.waitForTimeout(retryDelayMs);
-          if (/\/(?:dp|gp\/offer-listing)\//i.test(page.url())) {
-            await navigateToCart(page);
-          }
-          continue;
-        }
-
-        if (await selectAmazonBuyingOption(page)) {
-          attempts += 1;
-          await page.waitForTimeout(retryDelayMs);
+          await page
+            .goto(activeCheckoutUrl, {
+              waitUntil: "domcontentloaded",
+              timeout: 15000,
+            })
+            .catch(() => {});
           continue;
         }
 
@@ -408,14 +581,38 @@ async function main() {
           })
           .catch(() => {});
       }
+      if (submissionAttempted) {
+        console.error(
+          "AMAZON_ORDER_CONFIRMATION_AMBIGUOUS - submitted page closed before confirmation",
+        );
+        process.exit(1);
+      }
     } catch (error) {
-      console.error(`AMAZON_PREORDER_RECONNECT ${error.message}`);
+      if (submissionAttempted) {
+        console.error(
+          `AMAZON_ORDER_CONFIRMATION_AMBIGUOUS ${sanitizeAmazonError(error)}`,
+        );
+        process.exit(1);
+      }
+      console.error(
+        `AMAZON_DIRECT_BUY_RECONNECT ${sanitizeAmazonError(error)}`,
+      );
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  findAmazonDirectBuyOffer,
+  getDirectOffer,
+  hasVerifiedDirectCheckoutIdentity,
+  readFirstInputValue,
+  resolveVerifiedCheckoutUrl,
+};

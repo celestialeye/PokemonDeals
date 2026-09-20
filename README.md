@@ -129,9 +129,9 @@ scripts and redirected input. See
 - `target-watch.js`: End-to-end Target monitor for one to three product URLs. Uses Patchright by default, replays the page-owned fulfillment request, handles Preorder, Add to cart, and Buy now, and immediately drives checkout until explicit order confirmation.
 - `preorder.js`: Target product monitor. Watches configured product pages, clicks Preorder, closes failed-add dialogs, and stops monitoring a product after it is added to the cart.
 - `pokemoncenter-preorder.js`: Pokémon Center multi-product monitor. Keeps one tab per unique product, serializes shared-cart checkout, and stops after an explicit order confirmation.
-- `amazon-preorder.js`: Amazon product monitor. Clicks Pre-order now, returns from unavailable-item checkout pages, retries, and submits the order when checkout becomes usable.
+- `amazon-preorder.js`: Amazon direct-buy monitor. Accepts a product URL or direct Buy Now URL, verifies a current Amazon-sold and Amazon-shipped offer, enters checkout without adding to cart, retries unavailable checkout states, and submits only after price and product validation.
 - `amazon-multi-preorder.js`: Amazon multi-product monitor. Keeps one dedicated tab per product and serializes shared-cart checkout actions.
-- `amazon-checkout.js`: Amazon checkout monitor. Refreshes while quantity errors remain, advances with Continue, and submits the order when checkout becomes usable.
+- `amazon-checkout.js`: Amazon checkout monitor. Refreshes while quantity, update, or unavailable-item errors remain, advances with Continue, and submits the order when checkout becomes usable.
 - `screenshots/`: Preserved session screenshots with a traceable evidence index.
 - `archive/target-purchase-extension-2026-09-18/`: Retired Target Chrome extension source, tests, documentation, and run artifacts.
 
@@ -726,35 +726,82 @@ block. Key facts:
 Do not integrate automated CAPTCHA solving. Resume monitoring only after the
 challenge has been completed manually and the normal retailer page is visible.
 
-## Amazon preorder
+## Amazon direct buy and preorder
+
+The project skill can run the complete single-product flow:
+
+```text
+/amazon-buy <Amazon product or direct Buy Now checkout URL>
+```
+
+After adding or updating the skill during an active Copilot CLI session, run
+`/skills reload` once. Invoking `/amazon-buy` authorizes one quantity-one order
+for the supplied ASIN. Product URLs may use `/dp/ASIN` or `/gp/product/ASIN`.
+Direct Buy Now URLs may use `/checkout/entry/buynow` and must contain one valid
+`asin`, `offeringID`, `quantity=1`, and `buyNow=1`. The flow uses the
+user-approved `$10000` item-price and order-total fail-safe ceilings, ignores
+return-policy text such as `Final sale`, and never selects a third-party seller.
+
+The equivalent direct command is:
 
 ```powershell
 Set-Location 'F:\Repos\personal\temp\PokemonDeals'
+Remove-Item Env:AMAZON_CHECKOUT_URL -ErrorAction SilentlyContinue
 $env:AMAZON_PRODUCT_URL = '<Amazon product URL>'
-$env:AMAZON_EXPECTED_ASIN = '<10-character Amazon ASIN>'
-$env:AMAZON_EXPECTED_TITLE = '<exact expected product title>'
-$env:AMAZON_MAX_ITEM_PRICE = '30'
-$env:AMAZON_MAX_ORDER_TOTAL = '40'
-npm run amazon:preorder
+$env:AMAZON_MAX_ITEM_PRICE = '10000'
+$env:AMAZON_MAX_ORDER_TOTAL = '10000'
+npm run amazon:direct-buy
 ```
 
-The Amazon preorder worker:
+For a direct Buy Now URL, set `AMAZON_CHECKOUT_URL` instead of
+`AMAZON_PRODUCT_URL`:
 
-1. Opens the supplied product URL.
-2. Clicks Pre-order now when enabled.
-3. If the direct button is absent, opens See All Buying Options or falls back to Amazon's offer-listing page.
-4. Selects only an offer that is both shipped from and sold by Amazon and does not exceed `AMAZON_MAX_ITEM_PRICE`.
-5. Rejects direct Pre-order now offers unless their buy box also confirms Amazon as both shipper and seller within the price limit.
-6. Selects only the expected ASIN in the active cart and deselects every other cart item.
-7. Refuses to enter checkout or place an order unless the expected ASIN or exact expected title is present.
-8. Refreshes and retries when no qualifying Amazon offer is available.
-9. Clicks Go back when Amazon reports that the item is currently unavailable.
-10. Returns to the product page and retries after a conservative delay.
-11. Clicks Continue or Continue shopping on Amazon retry/interstitial pages.
-12. Pauses for manual completion of robot checks or CAPTCHA challenges.
-13. Blocks final submission unless the checkout order total is detected and does not exceed `AMAZON_MAX_ORDER_TOTAL`.
-14. Proceeds to checkout and clicks Place your order when checkout becomes usable.
-15. Stops only after detecting an Amazon order confirmation.
+```powershell
+Set-Location 'F:\Repos\personal\temp\PokemonDeals'
+Remove-Item Env:AMAZON_PRODUCT_URL -ErrorAction SilentlyContinue
+$env:AMAZON_CHECKOUT_URL = '<current Amazon direct Buy Now URL>'
+$env:AMAZON_MAX_ITEM_PRICE = '10000'
+$env:AMAZON_MAX_ORDER_TOTAL = '10000'
+npm run amazon:direct-buy
+```
+
+`amazon:preorder` remains an alias for the same worker.
+The worker derives the ASIN from either accepted URL form.
+`AMAZON_EXPECTED_ASIN` can enforce an explicit matching ASIN, and
+`AMAZON_EXPECTED_TITLE` can provide an additional checkout identity check.
+The `/amazon-buy` launcher reuses CDP on port `9444`. If it is unavailable, it
+restarts the documented authenticated Default Chrome profile with CDP enabled
+and restores the previous browser session.
+
+The Amazon direct-buy worker:
+
+1. Opens the supplied product URL, or derives the product page from a supplied direct Buy Now URL.
+2. Reads the main Buy Box and, when necessary, See All Buying Options or Amazon's offer-listing page.
+3. Accepts only a current offer that is both shipped from and sold by Amazon, matches the expected ASIN, exposes an active purchase control and offer token, and does not exceed `AMAZON_MAX_ITEM_PRICE`.
+4. Reuses a supplied direct Buy Now URL only when its offer token matches the verified current Amazon offer; otherwise it constructs a replacement URL from the verified offer without clicking Add to cart.
+5. Refreshes and retries when no qualifying Amazon offer is available.
+6. Refreshes the direct checkout URL once per second while quantity, update, or unavailable-item errors remain.
+7. Rechecks the product offer after every ten unavailable checkout responses and switches to a newly issued token when Amazon rotates it.
+8. Clicks Continue or Continue shopping on Amazon retry/interstitial pages.
+9. Pauses for manual completion of sign-in, robot checks, or CAPTCHA challenges.
+10. Confirms an explicit Amazon duplicate-order warning when Amazon says the item was recently purchased, including affirmative checkbox/radio controls and one order-anyway confirmation.
+11. Refuses to place an order unless the expected ASIN or exact expected title is present.
+12. Blocks final submission unless the checkout order total is detected and does not exceed `AMAZON_MAX_ORDER_TOTAL`.
+13. Clicks the normal Place your order control at most once; a duplicate-order confirmation is allowed only inside an explicit duplicate warning.
+14. Stops successfully only after detecting an Amazon order confirmation.
+
+### Amazon run logs
+
+Every Amazon purchase worker writes a timestamped JSONL event log under the
+gitignored `logs/` directory. `/amazon-buy` prints an `AMAZON_LOG_FILE` URL at
+startup so the exact file can be opened later. The log includes launcher setup,
+offer discovery, checkout retries, token refresh events, verification/sign-in
+pauses, duplicate-order confirmation, submission, process exit, and terminal
+outcome.
+
+Checkout URLs, offer tokens, order numbers, authorization values, cookies, and
+session tokens are redacted before writing. Page bodies and account details are
+not recorded.
 
 ## Amazon multi-product monitoring
 
@@ -806,6 +853,9 @@ the remaining tabs after each product's confirmed order.
 ## Amazon checkout
 
 Amazon checkout URLs contain short-lived execution identifiers. Supply the current complete URL through the environment for each run; do not save it in source control.
+This lower-level `amazon:checkout` worker is not used by `/amazon-buy`; the
+skill routes supplied Buy Now URLs through `amazon:direct-buy` so product,
+seller, shipper, item-price, and order-total guards remain active.
 
 ```powershell
 Set-Location 'F:\Repos\personal\temp\PokemonDeals'
@@ -816,7 +866,7 @@ npm run amazon:checkout
 The Amazon worker:
 
 1. Opens the supplied checkout URL.
-2. Refreshes once per second while quantity/update errors remain.
+2. Refreshes once per second while quantity, update, or unavailable-item errors remain.
 3. Pauses for manual completion of robot checks or CAPTCHA challenges.
 4. Clicks Continue when the checkout flow requires it.
 5. Clicks Place your order when enabled.

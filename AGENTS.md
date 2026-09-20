@@ -9,10 +9,13 @@ engine. The root JavaScript files are the operational workers:
 - `monitor.js` — Target checkout state machine.
 - `preorder.js` — Target product monitor.
 - `pokemoncenter-preorder.js` — Pokémon Center multi-product monitor and serialized checkout.
-- `amazon-preorder.js` and `amazon-checkout.js` — Amazon workflows.
+- `amazon-preorder.js` — guarded Amazon product/direct Buy Now URL monitor; `amazon-checkout.js` — transient checkout-URL retry worker.
 - `monitor_with_captcha_simulation.js` — experimental, syntax-checked only.
 
 `README.md` is the usage reference, `SESSION-LEARNINGS.md` records state-machine and timing decisions, and `screenshots/` contains indexed evidence. Project-specific agent notes are in `.github/copilot-instructions.md`.
+The repository-level `.github/skills/amazon-buy/SKILL.md` skill provides the
+explicitly invoked `/amazon-buy <Amazon product or direct Buy Now URL>`
+purchase workflow.
 
 ## Build, Test, and Development Commands
 
@@ -42,7 +45,10 @@ because active modes can place real orders.
 
 The shared engine currently has a Target adapter only. Amazon and Pokémon
 Center remain legacy direct workers; their documented commands can be
-orchestrated by the main agent.
+orchestrated by the main agent. These include `npm run target:checkout`,
+`npm run target:preorder`, `npm run pokemoncenter:preorder`,
+`npm run amazon:direct-buy` (`amazon:preorder` alias), and
+`npm run amazon:checkout`.
 
 Operational requests are not development tasks. Do not route them through the
 `/deals` development harness or its subagents. Do not merely return commands
@@ -85,4 +91,5 @@ include screenshots when selectors or checkout states change. Update
 |------|--------|-------|--------|
 | 2026-09-18 | Add initial development harness | `.pi/agents/`, `.pi/skills/`, `.pi/prompts/`, `.pi/tests/` | Bounded delegation, shared-session safety, and evidence-based review |
 | 2026-09-18 | Reconcile Target checkout completion guidance | Maintenance/verification skills, module map, evaluation cases | Independent review detected source changes during setup; preserve runtime work and follow executable state transitions |
+| 2026-09-19 | Add Amazon direct-buy skill | `.github/skills/amazon-buy/`, `amazon-preorder.js`, Amazon tests and docs | Convert a supplied product URL into a guarded direct checkout flow without cart navigation |
 | 2026-09-19 | Separate operational surfaces | `AGENTS.md`, Copilot instructions | Make AI-agent orchestration explicit while keeping the TUI marked as in development |
