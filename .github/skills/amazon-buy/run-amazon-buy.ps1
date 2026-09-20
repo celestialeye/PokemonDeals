@@ -131,82 +131,15 @@ try {
   }
   Write-AmazonRunEvent -Level "info" -Event "AMAZON_WORKER_PREFLIGHT_READY"
 
-  function Test-ChromeCdp {
-    try {
-      Invoke-RestMethod `
-        -Uri "http://127.0.0.1:9444/json/version" `
-        -TimeoutSec 2 `
-        -ErrorAction Stop |
-        Out-Null
-      return $true
-    } catch {
-      return $false
-    }
+  $cdpJson = & node -e 'const { ensureChromeCdp } = require("./src/chrome-cdp"); ensureChromeCdp().then((result) => process.stdout.write(JSON.stringify(result))).catch((error) => { console.error(error.message); process.exit(1); });'
+  if ($LASTEXITCODE -ne 0) {
+    throw "Chrome CDP bootstrap failed."
   }
-
-  if (Test-ChromeCdp) {
-    Write-AmazonRunEvent -Level "info" -Event "AMAZON_CDP_REUSED"
-  } else {
-    Write-AmazonRunEvent -Level "info" -Event "AMAZON_CDP_RESTARTING"
-    $browserProcesses = @(
-      Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'"
-    )
-    foreach ($browser in $browserProcesses) {
-      $process = Get-Process -Id $browser.ProcessId -ErrorAction SilentlyContinue
-      if ($process -and $process.MainWindowHandle -ne 0) {
-        $null = $process.CloseMainWindow()
-      }
-    }
-
-    $deadline = (Get-Date).AddSeconds(12)
-    do {
-      Start-Sleep -Milliseconds 500
-      $remainingBrowsers = @(
-        Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'"
-      )
-    } while (
-      $remainingBrowsers.Count -gt 0 -and
-      (Get-Date) -lt $deadline
-    )
-
-    foreach ($browserPid in @(
-      $remainingBrowsers | Select-Object -ExpandProperty ProcessId
-    )) {
-      Stop-Process -Id $browserPid -Force -ErrorAction SilentlyContinue
-    }
-
-    $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-    if (-not (Test-Path $chrome)) {
-      throw "Google Chrome was not found at the documented path."
-    }
-
-    $userData = "$env:LOCALAPPDATA\Google\Chrome\User Data"
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $chrome
-    $startInfo.UseShellExecute = $true
-    foreach ($argument in @(
-      "--user-data-dir=$userData",
-      "--profile-directory=Default",
-      "--remote-debugging-port=9444",
-      "--remote-allow-origins=*",
-      "--restore-last-session"
-    )) {
-      $null = $startInfo.ArgumentList.Add($argument)
-    }
-    $null = [System.Diagnostics.Process]::Start($startInfo)
-
-    $cdpReady = $false
-    for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
-      Start-Sleep -Milliseconds 500
-      if (Test-ChromeCdp) {
-        $cdpReady = $true
-        break
-      }
-    }
-    if (-not $cdpReady) {
-      throw "Chrome started, but CDP did not become available on port 9444."
-    }
+  $cdpResult = $cdpJson | ConvertFrom-Json
+  if ($cdpResult.started) {
     Write-AmazonRunEvent -Level "info" -Event "AMAZON_CDP_READY"
+  } else {
+    Write-AmazonRunEvent -Level "info" -Event "AMAZON_CDP_REUSED"
   }
 
   Write-AmazonRunEvent `

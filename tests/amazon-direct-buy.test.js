@@ -10,7 +10,13 @@ const {
   findAmazonDirectBuyOffer,
   getDirectOffer,
   hasVerifiedDirectCheckoutIdentity,
+  isAmazonCheckoutPageUrl,
+  parseCheckoutLineItemPrice,
+  parseCheckoutQuantity,
+  parseOrderTotal,
   resolveVerifiedCheckoutUrl,
+  selectExpectedCheckoutLineItem,
+  validateAmazonCheckoutEvidence,
 } = require("../amazon-preorder");
 const {
   offerAsinSelector,
@@ -150,45 +156,289 @@ test("discovers a qualifying Amazon offer from buying options without adding it 
   });
 });
 
-test("preserves product identity when checkout omits visible ASIN markup", () => {
+test("requires the active checkout URL and offer token to match", () => {
+  const checkoutUrl =
+    "https://www.amazon.com/checkout/entry/buynow?asin=B0GW2DK37Q&offeringID=verified%2Boffer%3D&quantity=1&buyNow=1";
+
   assert.equal(
     hasVerifiedDirectCheckoutIdentity({
-      activeCheckoutUrl:
-        "https://www.amazon.com/checkout/entry/buynow?<redacted>",
+      activeCheckoutUrl: checkoutUrl,
       activeOfferAsin: "B0GW2DK37Q",
-      activeOfferListingId: "verified-offer-token",
+      activeOfferListingId: "verified+offer=",
       expectedAsin: "B0GW2DK37Q",
     }),
     true,
   );
   assert.equal(
     hasVerifiedDirectCheckoutIdentity({
-      activeCheckoutUrl:
-        "https://www.amazon.com/checkout/entry/buynow?<redacted>",
-      activeOfferAsin: "B0007VO0DU",
-      activeOfferListingId: "wrong-product-token",
+      activeCheckoutUrl: checkoutUrl,
+      activeOfferAsin: "B0GW2DK37Q",
+      activeOfferListingId: "stale-offer-token",
+      expectedAsin: "B0GW2DK37Q",
+    }),
+    false,
+  );
+  assert.equal(
+    hasVerifiedDirectCheckoutIdentity({
+      activeCheckoutUrl: "https://www.amazon.com/checkout/entry/buynow?<redacted>",
+      activeOfferAsin: "B0GW2DK37Q",
+      activeOfferListingId: "verified+offer=",
       expectedAsin: "B0GW2DK37Q",
     }),
     false,
   );
 });
 
-test("uses a supplied Buy Now URL only when its token matches the verified Amazon offer", () => {
-  const suppliedUrl =
-    "https://www.amazon.com/checkout/entry/buynow?asin=B0GW2DK37Q&offeringID=verified%2Boffer%3D&quantity=1&buyNow=1&tag=emeraldalerts-20";
+test("recognizes Amazon checkout and gp/buy routes only", () => {
+  assert.equal(
+    isAmazonCheckoutPageUrl(
+      "https://www.amazon.com/checkout/entry/buynow?asin=B0GW2DK37Q",
+    ),
+    true,
+  );
+  assert.equal(
+    isAmazonCheckoutPageUrl(
+      "https://www.amazon.com/gp/buy/spc/handlers/display.html",
+    ),
+    true,
+  );
+  assert.equal(
+    isAmazonCheckoutPageUrl("https://www.amazon.com/gp/buy/thankyou"),
+    true,
+  );
+  assert.equal(
+    isAmazonCheckoutPageUrl("https://www.amazon.com/dp/B0GW2DK37Q"),
+    false,
+  );
+  assert.equal(
+    isAmazonCheckoutPageUrl("https://example.com/checkout/entry/buynow"),
+    false,
+  );
+});
 
+test("validates current checkout identity, quantity, item price, and total", () => {
+  const bodyText = [
+    "Pokemon Trading Card Game",
+    "Qty: 1",
+    "Items: $26.87",
+    "Order total: $28.91",
+  ].join("\n");
+  const lineItem = selectExpectedCheckoutLineItem(
+    [
+      {
+        asins: ["B0GW2DK37Q"],
+        text: "Pokemon Trading Card Game Qty: 1 $26.87",
+      },
+    ],
+    { expectedAsin: "B0GW2DK37Q" },
+  );
+
+  assert.equal(parseCheckoutQuantity(bodyText), 1);
+  assert.equal(parseCheckoutLineItemPrice(lineItem.text), 26.87);
+  assert.equal(parseOrderTotal(bodyText), 28.91);
   assert.deepEqual(
-    resolveVerifiedCheckoutUrl({
-      asin: "B0GW2DK37Q",
-      offerListingId: "verified%2Boffer%3D",
-      tag: "emeraldalerts-20",
-      suppliedUrl,
-      suppliedListingId: "verified+offer=",
+    validateAmazonCheckoutEvidence({
+      currentCheckoutPageVerified: true,
+      directCheckoutIdentityVerified: true,
+      lineItem,
+      bodyText,
+      maxItemPrice: 30,
+      maxOrderTotal: 40,
     }),
     {
-      url: suppliedUrl,
-      usesSuppliedUrl: true,
+      ok: true,
+      itemPrice: 26.87,
+      orderTotal: 28.91,
+      quantity: 1,
     },
+  );
+});
+
+test("blocks stale identity, wrong quantity, and checkout price increases", () => {
+  const validText = "Qty: 1 Items: $26.87 Order total: $28.91";
+  const validLineItem = {
+    asins: ["B0GW2DK37Q"],
+    itemPrice: 26.87,
+    quantity: 1,
+    text: "Pokemon Trading Card Game Qty: 1 $26.87",
+  };
+
+  assert.deepEqual(
+    validateAmazonCheckoutEvidence({
+      currentCheckoutPageVerified: true,
+      directCheckoutIdentityVerified: false,
+      lineItem: validLineItem,
+      bodyText: validText,
+      maxItemPrice: 30,
+      maxOrderTotal: 40,
+    }),
+    { ok: false, reason: "product-mismatch" },
+  );
+  assert.deepEqual(
+    validateAmazonCheckoutEvidence({
+      currentCheckoutPageVerified: true,
+      directCheckoutIdentityVerified: true,
+      lineItem: {
+        ...validLineItem,
+        itemPrice: 53.74,
+        quantity: 2,
+      },
+      bodyText: "Qty: 2 Items: $53.74 Order total: $57.82",
+      maxItemPrice: 30,
+      maxOrderTotal: 60,
+    }),
+    { ok: false, reason: "quantity-not-one", quantity: 2 },
+  );
+  assert.deepEqual(
+    validateAmazonCheckoutEvidence({
+      currentCheckoutPageVerified: true,
+      directCheckoutIdentityVerified: true,
+      lineItem: {
+        ...validLineItem,
+        itemPrice: 31,
+      },
+      bodyText: "Qty: 1 Items: $31.00 Order total: $33.17",
+      maxItemPrice: 30,
+      maxOrderTotal: 40,
+    }),
+    {
+      ok: false,
+      reason: "item-price-over-limit",
+      itemPrice: 31,
+    },
+  );
+});
+
+test("blocks incomplete checkout evidence before submission", () => {
+  const base = {
+    currentCheckoutPageVerified: true,
+    directCheckoutIdentityVerified: true,
+    maxItemPrice: 30,
+    maxOrderTotal: 40,
+  };
+
+  assert.deepEqual(
+    validateAmazonCheckoutEvidence({
+      ...base,
+      currentCheckoutPageVerified: false,
+      lineItem: {
+        asins: ["B0GW2DK37Q"],
+        itemPrice: 26.87,
+        quantity: 1,
+        text: "Pokemon Trading Card Game Qty: 1 $26.87",
+      },
+      bodyText: "Order total: $28.91",
+    }),
+    { ok: false, reason: "product-mismatch" },
+  );
+  assert.deepEqual(
+    validateAmazonCheckoutEvidence({
+      ...base,
+      lineItem: null,
+      bodyText: "Order total: $28.91",
+    }),
+    { ok: false, reason: "product-mismatch" },
+  );
+  assert.deepEqual(
+    validateAmazonCheckoutEvidence({
+      ...base,
+      lineItem: {
+        asins: ["B0GW2DK37Q"],
+        itemPrice: 26.87,
+        quantity: 1,
+        text: "Pokemon Trading Card Game Qty: 1 $26.87",
+      },
+      bodyText: "Qty: 1 Items: $26.87",
+    }),
+    { ok: false, reason: "order-total-missing" },
+  );
+});
+
+test("does not combine an expected recommendation with another ordered item", () => {
+  const candidates = [
+    {
+      asins: ["B0GW2DK37Q"],
+      text: "Recommended Pokemon Trading Card Game $26.87",
+    },
+    {
+      asins: ["B0007VO0DU"],
+      text: "Different ordered product Qty: 1 $19.99",
+    },
+  ];
+
+  assert.equal(
+    selectExpectedCheckoutLineItem(candidates, {
+      expectedAsin: "B0GW2DK37Q",
+    }),
+    null,
+  );
+});
+
+test("requires exactly one visible checkout line item", () => {
+  const candidates = [
+    {
+      asins: ["B0GW2DK37Q"],
+      text: "Expected item Qty: 1 $26.87",
+    },
+    {
+      asins: ["B0007VO0DU"],
+      text: "Second item Qty: 1 $19.99",
+    },
+  ];
+
+  assert.equal(
+    selectExpectedCheckoutLineItem(candidates, {
+      expectedAsin: "B0GW2DK37Q",
+    }),
+    null,
+  );
+});
+
+test("counts an unparseable second checkout item as a second item", () => {
+  const validItem = {
+    id: "item-1",
+    asins: ["B0GW2DK37Q"],
+    text: "Expected item Qty: 1 $26.87",
+  };
+
+  for (const secondItem of [
+    {
+      id: "item-2",
+      asins: ["B0007VO0DU"],
+      text: "Second item $19.99",
+    },
+    {
+      id: "item-2",
+      asins: ["B0007VO0DU"],
+      text: "Second item Qty: 1 $19.99 List price $24.99",
+    },
+  ]) {
+    assert.equal(
+      selectExpectedCheckoutLineItem([validItem, secondItem], {
+        expectedAsin: "B0GW2DK37Q",
+      }),
+      null,
+    );
+  }
+});
+
+test("uses a supplied offer token only when it matches the verified Amazon offer", () => {
+  const suppliedUrl =
+    "https://www.amazon.com/checkout/entry/buynow?asin=B0GW2DK37Q&offeringID=verified%2Boffer%3D&quantity=1&buyNow=1&tag=emeraldalerts-20&unexpected=discard-me";
+
+  const verified = resolveVerifiedCheckoutUrl({
+    asin: "B0GW2DK37Q",
+    offerListingId: "verified%2Boffer%3D",
+    tag: "emeraldalerts-20",
+    suppliedUrl,
+    suppliedListingId: "verified+offer=",
+  });
+  const parsedVerified = new URL(verified.url);
+  assert.equal(verified.suppliedOfferVerified, true);
+  assert.equal(parsedVerified.searchParams.get("unexpected"), null);
+  assert.equal(
+    parsedVerified.searchParams.get("offeringID"),
+    "verified+offer=",
   );
 
   const replacement = resolveVerifiedCheckoutUrl({
@@ -199,7 +449,7 @@ test("uses a supplied Buy Now URL only when its token matches the verified Amazo
     suppliedListingId: "stale+offer=",
   });
   const parsedReplacement = new URL(replacement.url);
-  assert.equal(replacement.usesSuppliedUrl, false);
+  assert.equal(replacement.suppliedOfferVerified, false);
   assert.equal(parsedReplacement.searchParams.get("asin"), "B0GW2DK37Q");
   assert.equal(
     parsedReplacement.searchParams.get("offeringID"),

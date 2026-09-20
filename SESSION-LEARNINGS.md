@@ -626,14 +626,22 @@ The repository-level `/amazon-buy <amazon-url>` skill is the operator entry
 point for this single-product flow. It accepts a product URL or a direct Buy Now
 URL containing one ASIN, offer token, `quantity=1`, and `buyNow=1`. A supplied
 checkout token is used only after it matches a current qualifying Amazon-sold
-and Amazon-shipped offer; a stale or different token is replaced with a newly
-verified offer. Invocation authorizes one quantity-one order, uses the
-user-approved `$10000` item and order-total fail-safe ceilings, ignores
+and Amazon-shipped offer. The worker always builds a canonical checkout URL
+from the validated ASIN and current token, discarding unrelated supplied query
+parameters; a stale or different token is replaced with a newly verified
+offer. Invocation authorizes one quantity-one order, uses fixed
+`$10000` item and order-total fail-safe ceilings, ignores
 return-policy text, refuses third-party offers, and does not expose supplied or
 generated checkout URLs. Its launcher reuses the authenticated CDP endpoint
-when available and otherwise restarts the documented authenticated Default
-Chrome profile with CDP enabled. It fails closed if another Amazon purchase
-worker is already running.
+when available and otherwise launches the dedicated persistent PokemonDeals
+Chrome profile with CDP enabled without closing unrelated Chrome sessions. It
+fails closed if another Amazon purchase worker is already running. Immediately
+before submission, the direct-buy worker revalidates the active checkout URL
+and offer token, visible product identity, quantity one, current item price,
+and order total; missing or changed evidence stops without clicking.
+`npm run test:amazon:e2e` exercises that scoped line-item validation in an
+isolated headless installed Chrome instance using local HTML only; it does not
+connect to CDP, contact Amazon, or submit an order.
 
 Amazon purchase workers now tee their event stream to timestamped JSONL files
 under the gitignored `logs/` directory. The `/amazon-buy` launcher records its

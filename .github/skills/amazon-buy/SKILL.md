@@ -24,10 +24,10 @@ authorization.
    `No returns`.
 4. Require the selected offer to match the URL ASIN and be both sold by and
    shipped from Amazon. For a supplied Buy Now URL, verify its offer token
-   against a current qualifying Amazon offer before checkout; if it is stale
-   or different, replace it with the current qualifying Amazon offer. Never
-   submit a third-party offer.
-5. Use the user's approved fail-safe defaults of `10000` USD for both
+   against a current qualifying Amazon offer before checkout. Build a canonical
+   direct Buy Now URL from the validated ASIN and current token; if the supplied
+   token is stale or different, replace it. Never submit a third-party offer.
+5. Use the repository fail-safe defaults of `10000` USD for both
    `AMAZON_MAX_ITEM_PRICE` and `AMAZON_MAX_ORDER_TOTAL`.
 6. If Amazon explicitly warns that the item was recently purchased or the
    order may be a duplicate, affirm the duplicate-order consent and continue
@@ -55,8 +55,9 @@ script; never concatenate the raw URL into executable command text. The script:
   invocations cannot race each other;
 - refuses to launch while another Amazon purchase worker is active, preventing
   duplicate or competing orders without terminating unrelated work;
-- reuses Chrome when CDP is available on port `9444`, otherwise restarts the
-  documented authenticated Default profile with CDP enabled;
+- reuses Chrome when CDP is available on port `9444`, otherwise launches the
+  dedicated persistent PokemonDeals Chrome profile without closing unrelated
+  Chrome sessions;
 - launches `npm run amazon:direct-buy` with the approved fail-safe limits.
 
 After launch, read the process output once to verify that the worker started.
@@ -75,6 +76,9 @@ Do not poll continuously; completion notifications are automatic.
   different, so the worker is using a newly verified qualifying Amazon offer.
 - `AMAZON_CHECKOUT_REFRESH`: checkout reports unavailable inventory; leave the
   worker running while it retries and periodically reacquires the offer token.
+- `AMAZON_OFFER_REVALIDATION_FAILED`: the previously selected offer is no
+  longer qualifying; the stale checkout was discarded and product monitoring
+  resumed.
 - `AMAZON_DUPLICATE_ORDER_CONFIRMED`: the worker accepted Amazon's explicit
   duplicate-order warning and continued the same authorized order.
 - `AMAZON_SIGN_IN_REQUIRED` or `AMAZON_VERIFICATION_REQUIRED`: tell the user to

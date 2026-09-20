@@ -155,7 +155,13 @@ Validate the scripts:
 
 ```powershell
 npm run check
+npm test
+npm run test:amazon:e2e
 ```
+
+The Amazon E2E test launches an isolated headless installed Chrome instance
+with local HTML fixtures only. It does not connect to the authenticated CDP
+profile, contact Amazon, or place an order.
 
 ## Deals purchasing engine reference
 
@@ -738,8 +744,8 @@ After adding or updating the skill during an active Copilot CLI session, run
 `/skills reload` once. Invoking `/amazon-buy` authorizes one quantity-one order
 for the supplied ASIN. Product URLs may use `/dp/ASIN` or `/gp/product/ASIN`.
 Direct Buy Now URLs may use `/checkout/entry/buynow` and must contain one valid
-`asin`, `offeringID`, `quantity=1`, and `buyNow=1`. The flow uses the
-user-approved `$10000` item-price and order-total fail-safe ceilings, ignores
+`asin`, `offeringID`, `quantity=1`, and `buyNow=1`. The flow uses fixed
+`$10000` item-price and order-total fail-safe ceilings, ignores
 return-policy text such as `Final sale`, and never selects a third-party seller.
 
 The equivalent direct command is:
@@ -770,23 +776,31 @@ The worker derives the ASIN from either accepted URL form.
 `AMAZON_EXPECTED_ASIN` can enforce an explicit matching ASIN, and
 `AMAZON_EXPECTED_TITLE` can provide an additional checkout identity check.
 The `/amazon-buy` launcher reuses CDP on port `9444`. If it is unavailable, it
-restarts the documented authenticated Default Chrome profile with CDP enabled
-and restores the previous browser session.
+launches the documented dedicated PokemonDeals Chrome profile with CDP enabled
+without closing unrelated Chrome sessions.
 
 The Amazon direct-buy worker:
 
 1. Opens the supplied product URL, or derives the product page from a supplied direct Buy Now URL.
 2. Reads the main Buy Box and, when necessary, See All Buying Options or Amazon's offer-listing page.
 3. Accepts only a current offer that is both shipped from and sold by Amazon, matches the expected ASIN, exposes an active purchase control and offer token, and does not exceed `AMAZON_MAX_ITEM_PRICE`.
-4. Reuses a supplied direct Buy Now URL only when its offer token matches the verified current Amazon offer; otherwise it constructs a replacement URL from the verified offer without clicking Add to cart.
+4. Accepts a supplied direct Buy Now token only when it matches the verified
+   current Amazon offer, then constructs a canonical checkout URL from the
+   validated ASIN and token without preserving unrelated query parameters or
+   clicking Add to cart.
 5. Refreshes and retries when no qualifying Amazon offer is available.
 6. Refreshes the direct checkout URL once per second while quantity, update, or unavailable-item errors remain.
-7. Rechecks the product offer after every ten unavailable checkout responses and switches to a newly issued token when Amazon rotates it.
+7. Rechecks the product offer after every ten unavailable checkout responses,
+   switches to a newly issued token when Amazon rotates it, and discards the
+   checkout if no qualifying Amazon offer remains.
 8. Clicks Continue or Continue shopping on Amazon retry/interstitial pages.
 9. Pauses for manual completion of sign-in, robot checks, or CAPTCHA challenges.
 10. Confirms an explicit Amazon duplicate-order warning when Amazon says the item was recently purchased, including affirmative checkbox/radio controls and one order-anyway confirmation.
-11. Refuses to place an order unless the expected ASIN or exact expected title is present.
-12. Blocks final submission unless the checkout order total is detected and does not exceed `AMAZON_MAX_ORDER_TOTAL`.
+11. Refuses to place an order unless the current checkout proves the expected
+    ASIN or exact expected title, quantity one, and a current item price within
+    `AMAZON_MAX_ITEM_PRICE`.
+12. Blocks final submission unless the checkout order total is detected and
+    does not exceed `AMAZON_MAX_ORDER_TOTAL`.
 13. Clicks the normal Place your order control at most once; a duplicate-order confirmation is allowed only inside an explicit duplicate warning.
 14. Stops successfully only after detecting an Amazon order confirmation.
 
