@@ -10,6 +10,7 @@ const {
   sanitizeAmazonError,
 } = require("./amazon-checkout");
 const {
+  amazonOfferListingIdsMatch,
   buildDirectBuyUrl,
   buildOfferListingUrl,
   isQualifyingAmazonOffer,
@@ -17,22 +18,34 @@ const {
   offerAddToCartSelector,
   offerContainerSelector,
   offerListingIdSelector,
+  parseAmazonCheckoutUrl,
   parseAmazonProductUrl,
   parseOfferPrice,
 } = require("./src/amazon-offers");
 
 const endpoint = "http://127.0.0.1:9444";
 const configuredProductUrl = process.env.AMAZON_PRODUCT_URL;
+const configuredCheckoutUrl = process.env.AMAZON_CHECKOUT_URL;
 const parsedProduct = configuredProductUrl
   ? parseAmazonProductUrl(configuredProductUrl)
   : null;
-const productUrl = parsedProduct?.url;
-const productAsin = parsedProduct?.asin;
-const associateTag = productUrl
-  ? new URL(productUrl).searchParams.get("tag")
+const parsedCheckout = configuredCheckoutUrl
+  ? parseAmazonCheckoutUrl(configuredCheckoutUrl)
+  : null;
+const inputAsin = parsedProduct?.asin || parsedCheckout?.asin;
+const productUrl =
+  parsedProduct?.url ||
+  (parsedCheckout
+    ? `https://www.amazon.com/dp/${parsedCheckout.asin}`
+    : null);
+const suppliedCheckoutUrl = parsedCheckout?.url || null;
+const suppliedOfferListingId = parsedCheckout?.offerListingId || null;
+const inputUrl = parsedProduct?.url || parsedCheckout?.url;
+const associateTag = inputUrl
+  ? new URL(inputUrl).searchParams.get("tag")
   : null;
 const expectedAsin =
-  process.env.AMAZON_EXPECTED_ASIN?.trim().toUpperCase() || productAsin;
+  process.env.AMAZON_EXPECTED_ASIN?.trim().toUpperCase() || inputAsin;
 const expectedTitle = process.env.AMAZON_EXPECTED_TITLE || "";
 const retryDelayMs = Number(process.env.AMAZON_RETRY_DELAY_MS || 2000);
 const maxItemPrice = Number(process.env.AMAZON_MAX_ITEM_PRICE || 30);
@@ -71,6 +84,25 @@ function hasVerifiedDirectCheckoutIdentity({
     Boolean(activeOfferListingId) &&
     activeOfferAsin === requiredAsin
   );
+}
+
+function resolveVerifiedCheckoutUrl({
+  asin,
+  offerListingId,
+  tag,
+  suppliedUrl,
+  suppliedListingId,
+}) {
+  const usesSuppliedUrl =
+    Boolean(suppliedUrl) &&
+    amazonOfferListingIdsMatch(offerListingId, suppliedListingId);
+
+  return {
+    url: usesSuppliedUrl
+      ? suppliedUrl
+      : buildDirectBuyUrl(asin, offerListingId, { tag }),
+    usesSuppliedUrl,
+  };
 }
 
 async function readFirstInputValue(scope, selector) {
@@ -212,16 +244,25 @@ async function findAmazonDirectBuyOffer(page) {
 }
 
 async function main() {
-  if (!productUrl) {
-    throw new Error("AMAZON_PRODUCT_URL is required.");
+  if (!configuredProductUrl && !configuredCheckoutUrl) {
+    throw new Error(
+      "AMAZON_PRODUCT_URL or AMAZON_CHECKOUT_URL is required.",
+    );
+  }
+  if (configuredProductUrl && configuredCheckoutUrl) {
+    throw new Error(
+      "Set exactly one of AMAZON_PRODUCT_URL or AMAZON_CHECKOUT_URL.",
+    );
   }
   if (!expectedAsin) {
     throw new Error(
-      "AMAZON_EXPECTED_ASIN is required when it cannot be read from AMAZON_PRODUCT_URL.",
+      "AMAZON_EXPECTED_ASIN is required when it cannot be read from the configured Amazon URL.",
     );
   }
-  if (productAsin !== expectedAsin) {
-    throw new Error("AMAZON_EXPECTED_ASIN does not match AMAZON_PRODUCT_URL.");
+  if (inputAsin !== expectedAsin) {
+    throw new Error(
+      "AMAZON_EXPECTED_ASIN does not match the configured Amazon URL.",
+    );
   }
   if (!Number.isFinite(retryDelayMs) || retryDelayMs < 1000) {
     throw new Error("AMAZON_RETRY_DELAY_MS must be at least 1000.");
@@ -253,6 +294,7 @@ async function main() {
   let submissionGuardsValidated = false;
   let submissionPage = null;
   let duplicateConfirmationAttempted = false;
+  let suppliedCheckoutDispositionLogged = false;
 
   while (true) {
     try {
@@ -393,18 +435,20 @@ async function main() {
 
             const refreshedOffer = await findAmazonDirectBuyOffer(page);
             if (refreshedOffer) {
-              const refreshedCheckoutUrl = buildDirectBuyUrl(
-                expectedAsin,
-                refreshedOffer.offerListingId,
-                { tag: associateTag },
-              );
+              const refreshedCheckout = resolveVerifiedCheckoutUrl({
+                asin: expectedAsin,
+                offerListingId: refreshedOffer.offerListingId,
+                tag: associateTag,
+                suppliedUrl: suppliedCheckoutUrl,
+                suppliedListingId: suppliedOfferListingId,
+              });
               if (refreshedOffer.offerListingId !== activeOfferListingId) {
                 console.log(
                   `AMAZON_OFFER_TOKEN_REFRESHED - ${refreshedOffer.source} Amazon at $${refreshedOffer.price.toFixed(2)}`,
                 );
                 activeOfferAsin = refreshedOffer.asin;
                 activeOfferListingId = refreshedOffer.offerListingId;
-                activeCheckoutUrl = refreshedCheckoutUrl;
+                activeCheckoutUrl = refreshedCheckout.url;
                 checkoutRefreshes = 0;
               }
             }
@@ -496,12 +540,23 @@ async function main() {
           attempts += 1;
           activeOfferAsin = directOffer.asin;
           activeOfferListingId = directOffer.offerListingId;
-          activeCheckoutUrl = buildDirectBuyUrl(
-            expectedAsin,
-            directOffer.offerListingId,
-            { tag: associateTag },
-          );
+          const resolvedCheckout = resolveVerifiedCheckoutUrl({
+            asin: expectedAsin,
+            offerListingId: directOffer.offerListingId,
+            tag: associateTag,
+            suppliedUrl: suppliedCheckoutUrl,
+            suppliedListingId: suppliedOfferListingId,
+          });
+          activeCheckoutUrl = resolvedCheckout.url;
           checkoutRefreshes = 0;
+          if (suppliedCheckoutUrl && !suppliedCheckoutDispositionLogged) {
+            console.log(
+              resolvedCheckout.usesSuppliedUrl
+                ? "AMAZON_SUPPLIED_CHECKOUT_VERIFIED"
+                : "AMAZON_SUPPLIED_CHECKOUT_REPLACED - using current qualifying Amazon offer",
+            );
+            suppliedCheckoutDispositionLogged = true;
+          }
           console.log(
             `AMAZON_DIRECT_CHECKOUT_FOUND ${attempts} - ${directOffer.source} Amazon at $${directOffer.price.toFixed(2)}`,
           );
@@ -559,4 +614,5 @@ module.exports = {
   getDirectOffer,
   hasVerifiedDirectCheckoutIdentity,
   readFirstInputValue,
+  resolveVerifiedCheckoutUrl,
 };

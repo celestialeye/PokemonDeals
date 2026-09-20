@@ -1,5 +1,6 @@
 const assert = require("assert");
 const {
+  amazonOfferListingIdsMatch,
   buildDirectBuyUrl,
   buildOfferListingUrl,
   isQualifyingAmazonOffer,
@@ -7,6 +8,8 @@ const {
   offerAddToCartSelector,
   offerContainerSelector,
   offerListingIdSelector,
+  parseAmazonBuyUrl,
+  parseAmazonCheckoutUrl,
   parseAmazonProductUrl,
 } = require("../src/amazon-offers");
 
@@ -64,6 +67,53 @@ assert.throws(
       "https://www.amazon.com/dp/B0007VO0DU https://www.amazon.com/dp/B0GW2DK37Q",
     ),
   /must contain exactly one URL/i,
+);
+
+const suppliedCheckoutUrl =
+  "https://www.amazon.com/checkout/entry/buynow?asin=B0007VO0DU&offeringID=token%2Bwith%2Fcharacters%3D%3D&pipelineType=Chewbacca&d=tempo&quantity=1&buyNow=1&tag=emeraldalerts-20";
+assert.deepStrictEqual(parseAmazonCheckoutUrl(suppliedCheckoutUrl), {
+  asin: "B0007VO0DU",
+  offerListingId: "token+with/characters==",
+  url: suppliedCheckoutUrl,
+});
+assert.deepStrictEqual(parseAmazonBuyUrl(suppliedCheckoutUrl), {
+  type: "checkout",
+  asin: "B0007VO0DU",
+  offerListingId: "token+with/characters==",
+  url: suppliedCheckoutUrl,
+});
+assert.deepStrictEqual(
+  parseAmazonBuyUrl("amazon.com/dp/B0GW2DK37Q"),
+  {
+    type: "product",
+    asin: "B0GW2DK37Q",
+    url: "https://amazon.com/dp/B0GW2DK37Q",
+  },
+);
+assert.throws(
+  () =>
+    parseAmazonCheckoutUrl(
+      "https://www.amazon.com/checkout/entry/buynow?asin=B0007VO0DU&quantity=1&buyNow=1",
+    ),
+  /exactly one offeringID parameter/i,
+);
+assert.throws(
+  () =>
+    parseAmazonCheckoutUrl(
+      "https://www.amazon.com/checkout/entry/buynow?asin=B0007VO0DU&offeringID=token&quantity=2&buyNow=1",
+    ),
+  /quantity must be 1/i,
+);
+assert.strictEqual(
+  amazonOfferListingIdsMatch(
+    "token%2Bwith%2Fcharacters%3D%3D",
+    "token+with/characters==",
+  ),
+  true,
+);
+assert.strictEqual(
+  amazonOfferListingIdsMatch("first-token", "second-token"),
+  false,
 );
 
 const directBuyUrl = buildDirectBuyUrl(

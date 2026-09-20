@@ -2,7 +2,8 @@
 param(
   [Parameter(Mandatory = $true, Position = 0)]
   [ValidateNotNullOrEmpty()]
-  [string]$ProductUrl,
+  [Alias("ProductUrl")]
+  [string]$AmazonUrl,
 
   [ValidateRange(0.01, 10000)]
   [decimal]$MaxItemPrice = 10000,
@@ -79,7 +80,8 @@ try {
   }
   Write-AmazonRunEvent -Level "info" -Event "AMAZON_LAUNCHER_LOCK_ACQUIRED"
 
-  $env:AMAZON_PRODUCT_URL = $ProductUrl
+  Remove-Item Env:AMAZON_CHECKOUT_URL -ErrorAction SilentlyContinue
+  $env:AMAZON_PRODUCT_URL = $AmazonUrl
   $env:AMAZON_MAX_ITEM_PRICE = $MaxItemPrice.ToString(
     [System.Globalization.CultureInfo]::InvariantCulture
   )
@@ -89,15 +91,24 @@ try {
   Remove-Item Env:AMAZON_EXPECTED_ASIN -ErrorAction SilentlyContinue
   Remove-Item Env:AMAZON_EXPECTED_TITLE -ErrorAction SilentlyContinue
 
-  $productAsin = & node -e 'const { parseAmazonProductUrl } = require("./src/amazon-offers"); const product = parseAmazonProductUrl(process.env.AMAZON_PRODUCT_URL); process.stdout.write(product.asin);'
+  $inputJson = & node -e 'const { parseAmazonBuyUrl } = require("./src/amazon-offers"); const input = parseAmazonBuyUrl(process.env.AMAZON_PRODUCT_URL); process.stdout.write(JSON.stringify({ type: input.type, asin: input.asin }));'
   if ($LASTEXITCODE -ne 0) {
-    throw "Amazon product URL validation failed."
+    throw "Amazon URL validation failed."
+  }
+  $inputMetadata = $inputJson | ConvertFrom-Json
+  $inputType = [string]$inputMetadata.type
+  $inputAsin = [string]$inputMetadata.asin
+  if ($inputType -eq "checkout") {
+    $env:AMAZON_CHECKOUT_URL = $AmazonUrl
+    Remove-Item Env:AMAZON_PRODUCT_URL
+  } elseif ($inputType -ne "product") {
+    throw "Amazon URL classification failed."
   }
   Write-AmazonRunEvent `
     -Level "info" `
-    -Event "AMAZON_PRODUCT_ACCEPTED" `
-    -Data @{ asin = $productAsin; quantity = 1 }
-  Write-Host "AMAZON_PRODUCT_ACCEPTED asin=$productAsin"
+    -Event "AMAZON_INPUT_ACCEPTED" `
+    -Data @{ asin = $inputAsin; inputType = $inputType; quantity = 1 }
+  Write-Host "AMAZON_INPUT_ACCEPTED type=$inputType asin=$inputAsin"
 
   & node -e 'require.resolve("playwright-core")' *> $null
   if ($LASTEXITCODE -ne 0) {
@@ -202,7 +213,8 @@ try {
     -Level "info" `
     -Event "AMAZON_WORKER_STARTING" `
     -Data @{
-      asin = $productAsin
+      asin = $inputAsin
+      inputType = $inputType
       maxItemPrice = $env:AMAZON_MAX_ITEM_PRICE
       maxOrderTotal = $env:AMAZON_MAX_ORDER_TOTAL
       quantity = 1
@@ -229,6 +241,8 @@ try {
     -Data @{ error = $_.Exception.Message }
   throw
 } finally {
+  Remove-Item Env:AMAZON_PRODUCT_URL -ErrorAction SilentlyContinue
+  Remove-Item Env:AMAZON_CHECKOUT_URL -ErrorAction SilentlyContinue
   if ($mutexHeld) {
     $mutex.ReleaseMutex()
   }

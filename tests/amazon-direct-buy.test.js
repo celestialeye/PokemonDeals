@@ -3,12 +3,14 @@ const test = require("node:test");
 
 process.env.AMAZON_PRODUCT_URL =
   "https://www.amazon.com/dp/B0GW2DK37Q?m=ATVPDKIKX0DER";
+delete process.env.AMAZON_CHECKOUT_URL;
 process.env.AMAZON_MAX_ITEM_PRICE = "30";
 
 const {
   findAmazonDirectBuyOffer,
   getDirectOffer,
   hasVerifiedDirectCheckoutIdentity,
+  resolveVerifiedCheckoutUrl,
 } = require("../amazon-preorder");
 const {
   offerAsinSelector,
@@ -168,5 +170,43 @@ test("preserves product identity when checkout omits visible ASIN markup", () =>
       expectedAsin: "B0GW2DK37Q",
     }),
     false,
+  );
+});
+
+test("uses a supplied Buy Now URL only when its token matches the verified Amazon offer", () => {
+  const suppliedUrl =
+    "https://www.amazon.com/checkout/entry/buynow?asin=B0GW2DK37Q&offeringID=verified%2Boffer%3D&quantity=1&buyNow=1&tag=emeraldalerts-20";
+
+  assert.deepEqual(
+    resolveVerifiedCheckoutUrl({
+      asin: "B0GW2DK37Q",
+      offerListingId: "verified%2Boffer%3D",
+      tag: "emeraldalerts-20",
+      suppliedUrl,
+      suppliedListingId: "verified+offer=",
+    }),
+    {
+      url: suppliedUrl,
+      usesSuppliedUrl: true,
+    },
+  );
+
+  const replacement = resolveVerifiedCheckoutUrl({
+    asin: "B0GW2DK37Q",
+    offerListingId: "current%2Bamazon%3D",
+    tag: "emeraldalerts-20",
+    suppliedUrl,
+    suppliedListingId: "stale+offer=",
+  });
+  const parsedReplacement = new URL(replacement.url);
+  assert.equal(replacement.usesSuppliedUrl, false);
+  assert.equal(parsedReplacement.searchParams.get("asin"), "B0GW2DK37Q");
+  assert.equal(
+    parsedReplacement.searchParams.get("offeringID"),
+    "current+amazon=",
+  );
+  assert.equal(
+    parsedReplacement.searchParams.get("tag"),
+    "emeraldalerts-20",
   );
 });

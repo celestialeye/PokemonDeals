@@ -23,9 +23,11 @@ test("amazon-buy skill declares the guarded one-product purchase workflow", () =
   const skill = fs.readFileSync(skillPath, "utf8");
 
   assert.match(skill, /^---\r?\nname: amazon-buy\r?\n/m);
-  assert.match(skill, /explicitly invokes `\/amazon-buy <product-url>`/);
+  assert.match(skill, /explicitly invokes `\/amazon-buy <amazon-url>`/);
   assert.match(skill, /one quantity-one order/);
   assert.match(skill, /sold by and\s+shipped from Amazon/);
+  assert.match(skill, /\/checkout\/entry\/buynow/);
+  assert.match(skill, /verify its offer token/);
   assert.match(skill, /Final sale/);
   assert.match(skill, /10000/);
   assert.match(skill, /shell ID `amazon-buy`/);
@@ -39,8 +41,9 @@ test("amazon-buy runner uses the repository worker and documented CDP profile", 
 
   assert.match(runner, /\[decimal\]\$MaxItemPrice = 10000/);
   assert.match(runner, /\[decimal\]\$MaxOrderTotal = 10000/);
-  assert.match(runner, /\$env:AMAZON_PRODUCT_URL = \$ProductUrl/);
-  assert.match(runner, /parseAmazonProductUrl/);
+  assert.match(runner, /\$env:AMAZON_PRODUCT_URL = \$AmazonUrl/);
+  assert.match(runner, /\$env:AMAZON_CHECKOUT_URL = \$AmazonUrl/);
+  assert.match(runner, /parseAmazonBuyUrl/);
   assert.match(runner, /127\.0\.0\.1:9444\/json\/version/);
   assert.match(runner, /Google\\Chrome\\User Data/);
   assert.match(runner, /--profile-directory=Default/);
@@ -55,6 +58,7 @@ test("amazon-buy runner uses the repository worker and documented CDP profile", 
   assert.match(runner, /Write-AmazonRunEvent/);
   assert.match(runner, /AMAZON_WORKER_EXIT/);
   assert.match(runner, /npm run amazon:direct-buy/);
+  assert.doesNotMatch(runner, /npm run amazon:checkout/);
   assert.match(runner, /A competing Amazon purchase worker is already running/);
   assert.doesNotMatch(runner, /Stop-Process -Name/);
   assert.doesNotMatch(runner, /AMAZON_BUY_STOPPING_COMPETING_WORKER/);

@@ -12,7 +12,7 @@ Use the `subagent` tool with `agentScope: "both"` and `confirmProjectAgents: tru
 ## 0. Context, safety, and triage
 
 1. Read `AGENTS.md`, `.github/copilot-instructions.md`, `.pi/skills/deals-maintenance/SKILL.md`, and `.pi/skills/deals-verification/SKILL.md`. Resolve the absolute repository root and use it as `cwd` for every subagent; in parallel/chain mode set each task's cwd too.
-2. An empty or ambiguous request needs a scope question, not an invented product or purchase task. A request to run a worker gets a safety explanation and a separately approved operator procedure, not delegation to a development agent. No worker launch, CDP/browser contact, live retailer request, Discord notification, credential access, or purchase in this workflow.
+2. An empty or ambiguous request needs a scope question, not an invented product or purchase task. A request to poll or purchase is an operational request governed by `AGENTS.md` and `.github/copilot-instructions.md`; return it to the main agent instead of delegating it to this development harness. No worker launch, CDP/browser contact, live retailer request, Discord notification, credential access, or purchase occurs inside this workflow.
 3. Inspect `.pi/agents/` before invoking their definitions. Respect project-agent trust confirmation. Do not install extensions, change global settings, switch model routes, or disable confirmation to recover a failure.
 4. Classify the request:
    - **Conversational:** answer directly from bounded source evidence; no team or workspace needed.

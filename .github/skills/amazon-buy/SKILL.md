@@ -1,27 +1,32 @@
 ---
 name: amazon-buy
-description: Monitor one Amazon product URL for an Amazon-sold and Amazon-shipped offer, derive its direct Buy Now checkout URL, and place exactly one order after explicit /amazon-buy invocation.
+description: Accept one Amazon product or direct Buy Now checkout URL, verify an Amazon-sold and Amazon-shipped offer, and place exactly one order after explicit /amazon-buy invocation.
 ---
 
 # Amazon buy
 
-Use this skill only when the user explicitly invokes `/amazon-buy <product-url>`.
+Use this skill only when the user explicitly invokes `/amazon-buy <amazon-url>`.
 That invocation authorizes one quantity-one order for the ASIN in that URL. Do
 not treat discussion, analysis, testing, or a bare product link as purchase
 authorization.
 
 ## Required behavior
 
-1. Treat the text after `/amazon-buy` as the Amazon product URL. Accept
-   `amazon.com`, `https://amazon.com`, and `https://www.amazon.com` URLs whose
-   path contains either `/dp/ASIN` or `/gp/product/ASIN`. If the argument is
-   missing or contains more than one product URL, ask the user to clarify.
+1. Treat the text after `/amazon-buy` as one Amazon URL. Accept `amazon.com`,
+   `https://amazon.com`, and `https://www.amazon.com` product URLs whose path
+   contains `/dp/ASIN` or `/gp/product/ASIN`, or direct Buy Now URLs using
+   `/checkout/entry/buynow` with exactly one valid `asin`, `offeringID`,
+   `quantity=1`, and `buyNow=1`. If the argument is missing or contains more
+   than one URL, ask the user to clarify.
 2. Operate only in the PokemonDeals repository. Read the Amazon direct-buy
    section of `README.md` before launching.
 3. Use quantity one. Ignore return-policy text, including `Final sale` and
    `No returns`.
 4. Require the selected offer to match the URL ASIN and be both sold by and
-   shipped from Amazon. Never substitute a third-party offer.
+   shipped from Amazon. For a supplied Buy Now URL, verify its offer token
+   against a current qualifying Amazon offer before checkout; if it is stale
+   or different, replace it with the current qualifying Amazon offer. Never
+   submit a third-party offer.
 5. Use the user's approved fail-safe defaults of `10000` USD for both
    `AMAZON_MAX_ITEM_PRICE` and `AMAZON_MAX_ORDER_TOTAL`.
 6. If Amazon explicitly warns that the item was recently purchased or the
@@ -30,8 +35,8 @@ authorization.
 7. Do not manually click Add to cart, Buy Now, Continue, or Place order through
    browser tools. Launch the repository worker so one process owns the entire
    state machine.
-8. Never print, save, or commit the generated direct checkout URL or its offer
-   token.
+8. Never print, save, or commit a supplied or generated direct checkout URL or
+   its offer token.
 
 ## Launch procedure
 
@@ -40,7 +45,8 @@ attached asynchronous PowerShell session using shell ID `amazon-buy`. Assign
 the URL to a PowerShell variable as one quoted literal before passing it to the
 script; never concatenate the raw URL into executable command text. The script:
 
-- validates the product URL and derives its ASIN;
+- validates and classifies the product or direct Buy Now URL and derives its
+  ASIN without printing the checkout URL or offer token;
 - creates a timestamped, gitignored JSONL run log and prints its clickable
   `AMAZON_LOG_FILE` URL;
 - installs existing repository dependencies only when `playwright-core` is
@@ -63,6 +69,10 @@ Do not poll continuously; completion notifications are automatic.
 - `AMAZON_LOG_FILE`: retain this local file URL for later incident analysis.
 - `AMAZON_DIRECT_CHECKOUT_FOUND`: the worker found an eligible offer and
   generated the direct checkout URL without adding to cart.
+- `AMAZON_SUPPLIED_CHECKOUT_VERIFIED`: the supplied Buy Now URL matches the
+  current qualifying Amazon offer.
+- `AMAZON_SUPPLIED_CHECKOUT_REPLACED`: the supplied offer token is stale or
+  different, so the worker is using a newly verified qualifying Amazon offer.
 - `AMAZON_CHECKOUT_REFRESH`: checkout reports unavailable inventory; leave the
   worker running while it retries and periodically reacquires the offer token.
 - `AMAZON_DUPLICATE_ORDER_CONFIRMED`: the worker accepted Amazon's explicit

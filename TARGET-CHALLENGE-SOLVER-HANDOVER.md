@@ -154,8 +154,7 @@ There is no verified official public HUMAN challenge URL. A deterministic real-p
 | `TARGET_CHALLENGE_SOLVER` | unset | Path/name of your solver module. Unset = pause-and-backoff only. |
 | `TARGET_CHALLENGE_SOLVE_ATTEMPTS` | `3` | Max solve attempts per challenge. |
 | `TARGET_CHALLENGE_SETTLE_MS` | `1500` | Wait before re-verifying each normally completed attempt. |
-| `TARGET_CHALLENGE_HOLD_MS` | `10000` | Maximum native hold, 100–15000 ms; release early when the control disappears. |
-| `TARGET_CHALLENGE_TIMEOUT_MS` | `20000` | Action budget, 1000–45000 ms and at least hold + 1000; cleanup may add 1500 ms. |
+| `TARGET_CHALLENGE_TIMEOUT_MS` | `20000` | Per-attempt safety budget, 1000–45000 ms; native input remains held until readable clearance, control disappearance, or timeout. Cleanup may add 1500 ms. |
 | `TARGET_CHALLENGE_VALIDATE` | unset | Observe-only recovery validation; requires a configured solver. |
 | `TARGET_MONITOR_MAX_RUNTIME_MS` | `0` | Optional run limit checked between operations; in-flight work may finish later. |
 | `TARGET_MONITOR_KEEP_PAGE` | unset | Preserve diagnostic tabs on normal observe-only exit. |

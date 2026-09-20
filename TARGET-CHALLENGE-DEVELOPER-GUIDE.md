@@ -106,10 +106,10 @@ The helper caps raw frames at 64 and total visible scopes at 32. Locator-only ad
 ## 5. One solver attempt, step by step
 
 1. Reject a missing/closed page or unsupported challenge kind before sending input. The built-in solver supports `press_and_hold`, not arbitrary CAPTCHA or access-denied screens.
-2. Validate timing configuration and establish one deadline. Discovery reserves time for the hold/release rather than consuming the entire attempt searching.
+2. Validate timing configuration and establish one deadline. Discovery reserves a small margin for pointer-down rather than consuming the entire attempt searching.
 3. Search visible scopes for an enabled button role named `Press & Hold` or `Press and hold`. Only if no eligible role control exists does it consider exact text matches. More than one candidate is an error, not a reason to choose `.first()`.
 4. Hover with actionability checks, retain an `ElementHandle`, and obtain current geometry. Browser coordinates are calculated at runtime; screenshot coordinates are never hardcoded. Retaining the handle prevents a progress-label change from looking like disappearance of the held element.
-5. Set the release flag **before** awaiting pointer-down. The browser may have received input even if its acknowledgement fails. Hold until the configured maximum or the held element disappears; disappearance is still not proof of clearance.
+5. Set the release flag **before** awaiting pointer-down. The browser may have received input even if its acknowledgement fails. Keep holding while the challenge remains present; release when readable clean-page evidence appears, the held element disappears, or the per-attempt safety budget expires. Element disappearance is still not proof of clearance.
 6. Attempt pointer-up in `finally`, including error/navigation/detach cases. Preserve the primary error if cleanup also fails. Disposing the handle releases an object reference, not the DOM element.
 7. Wait for live clearance within the remaining budget. A spinner, changed label, or `Please try again` message must not be treated as success. Return control to the driver for its own settle and independent verification.
 
@@ -121,8 +121,8 @@ See [README configuration](./README.md#target-url-availability-watch) for defaul
 
 | Layer | Owner / meaning |
 |---|---|
-| Maximum hold | Solver input duration, default 10 seconds; early disappearance can release sooner. |
-| Attempt budget | Solver discovery, input, and completion waiting, default 20 seconds. |
+| Dynamic hold | Solver keeps native input down while the challenge remains present; the provider determines the required duration. |
+| Attempt budget | Solver discovery, dynamic hold, and completion waiting, default 20 seconds. |
 | Cleanup allowance | Up to 1000 ms for release and 500 ms for handle disposal beyond the action deadline. |
 | Settle interval | Driver delay after a normally returned attempt, default 1500 ms, before another independent read. |
 | Attempt count | Driver; default three consecutive attempts on the page left by the previous attempt. |
@@ -147,8 +147,8 @@ For future operational verification, prefer the user's existing profile in obser
 | Signal | Interpretation / next diagnostic |
 |---|---|
 | `TARGET_CHALLENGE_DETECTED` | Readable challenge evidence was found; not a solve result. |
-| `TARGET_CHALLENGE_HOLD_STARTED` | Pointer-down returned normally. |
-| `TARGET_CHALLENGE_HOLD_FINISHED elapsedMs=...` | Total attempt telemetry, including discovery and completion waiting; **not continuous hold duration or success**. |
+| `TARGET_CHALLENGE_HOLD_STARTED` | Pointer-down returned normally; the solver is now waiting for readable clearance evidence or its attempt budget. |
+| `TARGET_CHALLENGE_HOLD_FINISHED elapsedMs=...` | Total attempt telemetry, including discovery, dynamic hold, cleanup, and completion waiting; **not success**. |
 | `TARGET_CHALLENGE_CLEARED` | The driver's independent post-attempt verification passed. |
 | `TARGET_CHALLENGE_SOLVED` | Monitor recovery/reset was recorded; still check subsequent API evidence. |
 | `TARGET_CHALLENGE_BACKOFF` | Unsupported, unreadable, unresolved, or failed recovery paused the worker. |

@@ -22,9 +22,11 @@ const {
   emptySecrets,
   secretRows,
 } = require("./src/deals-secrets");
+const { ensureChromeCdp } = require("./src/chrome-cdp");
 
 const catalogPath = path.join(__dirname, "data", "deals.json");
 const secretPath = path.join(__dirname, "data", "deals-secrets.local.json");
+const chromeCdpState = {};
 
 function parseCommandLine(argv) {
   const [command = null, ...tokens] = argv;
@@ -125,7 +127,7 @@ function printProducts(items, output = stdout) {
   ]);
   const headers = [
     "ID",
-    "Armed",
+    "Included",
     "Retailer",
     "Mode",
     "Name",
@@ -154,7 +156,8 @@ function printImportPreview(items, output = stdout) {
   output.write(`Parsed ${items.length} product(s):\n`);
   for (const item of items) {
     output.write(
-      `  ${item.group ? `[${item.group}] ` : ""}${item.name}: ${item.url}\n`,
+      `  ${item.group ? `[${item.group}] ` : ""}` +
+      `${item.name ? `${item.name}: ` : ""}${item.url}\n`,
     );
   }
 }
@@ -507,14 +510,18 @@ function prepareAdapterRun(adapter, items, executionMode, {
 
 async function runEngine(store, executionMode, options = {}) {
   const catalog = validateCatalog(await store.read());
-  const armed = catalog.items.filter((item) => item.armed);
+  const armed = catalog.items.filter(
+    (item) => item.armed && item.terminalOutcome !== "confirmed",
+  );
   if (armed.length === 0) {
-    throw new Error("No products are armed.");
+    throw new Error("No products are included in the run.");
   }
   const retailers = [...new Set(armed.map((item) => item.retailer))];
   const {
     adapterOptions = {},
     secretStore = null,
+    ensureCdp = false,
+    chromeOptions = {},
     ...sharedOptions
   } = options;
   const secrets = secretStore
@@ -524,7 +531,7 @@ async function runEngine(store, executionMode, options = {}) {
   for (const retailer of retailers) {
     const adapter = adapterForRetailer(retailer);
     if (!adapter) {
-      throw new Error(`Armed retailer "${retailer}" has no execution adapter.`);
+      throw new Error(`Included retailer "${retailer}" has no execution adapter.`);
     }
     const settings = adapter.settings
       ? adapter.settings.normalize(catalog.settings[retailer])
@@ -552,6 +559,13 @@ async function runEngine(store, executionMode, options = {}) {
         secrets,
         settings,
       }),
+    });
+  }
+
+  if (ensureCdp && plans.length > 0) {
+    await ensureChromeCdp({
+      ...chromeOptions,
+      state: chromeCdpState,
     });
   }
 
@@ -652,7 +666,7 @@ async function runCommand(store, secretStore, parsed) {
     if (!options.mode) {
       throw new Error("add requires --mode buy-now, preorder, or buy.");
     }
-    const armed = optionBoolean(options, "armed", "disarmed") || false;
+    const armed = optionBoolean(options, "armed", "disarmed") ?? true;
     const item = await store.add({
       name: options.name,
       group: options.group || "",
@@ -672,7 +686,7 @@ async function runCommand(store, secretStore, parsed) {
     if (parsedList.errors.length > 0) {
       throw new Error(parsedList.errors.join("\n"));
     }
-    const armed = optionBoolean(options, "armed", "disarmed") || false;
+    const armed = optionBoolean(options, "armed", "disarmed") ?? true;
     const added = await store.addMany(
       parsedList.items.map((item) => ({
         ...item,
@@ -711,7 +725,7 @@ async function runCommand(store, secretStore, parsed) {
     }
     const items = await store.setArmed(ids, command === "arm");
     stdout.write(
-      `${command === "arm" ? "Armed" : "Disarmed"} ${items.map((item) => item.id).join(", ")}.\n`,
+      `${command === "arm" ? "Included" : "Excluded"} ${items.map((item) => item.id).join(", ")}.\n`,
     );
     return;
   }
@@ -728,7 +742,7 @@ async function runCommand(store, secretStore, parsed) {
     const result = await runEngine(
       store,
       options.execution || options.mode || null,
-      { adapterOptions, secretStore },
+      { adapterOptions, secretStore, ensureCdp: true },
     );
     if (result.interrupted) {
       process.exitCode = 130;

@@ -11,6 +11,7 @@ const palette = Object.freeze({
   background: "#071019",
   panel: "#0d1b29",
   panelAlt: "#102536",
+  focus: "#185566",
   gold: "#f2c94c",
   cyan: "#56d6e7",
   text: "#d9e6ee",
@@ -20,11 +21,20 @@ const palette = Object.freeze({
   orange: "#ffad5c",
 });
 
+function selectionStyle(focused) {
+  return {
+    bg: focused ? palette.focus : palette.panelAlt,
+    fg: focused ? palette.text : palette.gold,
+    bold: true,
+  };
+}
+
 const navigationItems = Object.freeze([
   { id: "products", label: "Products" },
   { id: "import", label: "Import" },
   { id: "add", label: "Add Product" },
   { id: "run-setup", label: "Run Engine" },
+  { id: "run-stats", label: "Run Stats" },
   { id: "settings", label: "Settings" },
   { id: "secrets", label: "Secrets" },
   { id: "help", label: "Help" },
@@ -100,7 +110,7 @@ function formatProductCells(cells, widths) {
 
 function productTableHeader(width) {
   return formatProductCells(
-    ["ARM", "MODE", "STORE", "NAME", "GROUP", "STATUS", "CHECKED"],
+    ["RUN", "MODE", "STORE", "NAME", "GROUP", "STATUS", "CHECKED"],
     productColumnWidths(width),
   );
 }
@@ -171,6 +181,7 @@ function actionForKey(key) {
     i: "import",
     d: "delete",
     r: "run",
+    t: "run-stats",
     s: "settings",
     q: "quit",
     escape: "back",
@@ -193,10 +204,150 @@ function runSetupDefaults(items, settings = {}) {
     "live-purchase": "live-purchase",
   }[settings.defaultRunMode] || "stop-before-submit";
   return {
-    products: items.filter((item) => item.armed),
+    products: items.filter(
+      (item) => item.armed && item.terminalOutcome !== "confirmed",
+    ),
     executionMode: configuredMode,
     challengeSolver: settings.solverEnabled !== false,
   };
+}
+
+function createRunProjection() {
+  return {
+    statuses: {},
+    logs: [],
+    recentEvents: [],
+    productStats: {},
+    workers: {},
+    eventCount: 0,
+    pollCount: 0,
+    availableCount: 0,
+    unavailableCount: 0,
+    actionCount: 0,
+    verificationCount: 0,
+    errorCount: 0,
+    terminalCount: 0,
+    startedAt: null,
+    endedAt: null,
+    outcome: null,
+    lastEventAt: null,
+    lastStatus: null,
+    backoffUntil: null,
+  };
+}
+
+function cloneRunProjection(state = {}) {
+  const defaults = createRunProjection();
+  return {
+    ...defaults,
+    ...state,
+    statuses: { ...(state.statuses || {}) },
+    logs: [...(state.logs || [])],
+    recentEvents: [...(state.recentEvents || [])],
+    productStats: { ...(state.productStats || {}) },
+    workers: { ...(state.workers || {}) },
+  };
+}
+
+function classifyRunStatus(status, terminalOutcome = null) {
+  const value = String(status || "").toLowerCase();
+  const categories = {
+    poll: /^(monitoring|poll|availability|available|unavailable)\b/.test(value),
+    available: /^available\b/.test(value) && !/^unavailable\b/.test(value),
+    unavailable: /^unavailable\b/.test(value),
+    action: /action available|added to cart|checkout|purchase|order|cart/.test(value),
+    verification: /verification/.test(value),
+    error: /failed|error|invalid|unconfirmed|safety stop|worker-error/.test(value),
+    terminal: Boolean(terminalOutcome),
+  };
+  return categories;
+}
+
+function projectRunLifecycle(state, lifecycle = {}) {
+  const next = cloneRunProjection(state);
+  const at = lifecycle.at || new Date().toISOString();
+  const retailer = lifecycle.retailer || "worker";
+  const existing = next.workers[retailer] || {};
+  next.lastEventAt = at;
+  if (lifecycle.type === "starting") {
+    next.startedAt = next.startedAt || at;
+    next.endedAt = null;
+    next.outcome = null;
+    next.workers[retailer] = {
+      ...existing,
+      retailer,
+      status: "running",
+      mode: lifecycle.mode || existing.mode || "-",
+      itemIds: [...(lifecycle.itemIds || existing.itemIds || [])],
+      startedAt: existing.startedAt || at,
+      endedAt: null,
+      code: null,
+      signal: null,
+      interrupted: false,
+    };
+  } else if (lifecycle.type === "closed") {
+    next.endedAt = at;
+    next.workers[retailer] = {
+      ...existing,
+      retailer,
+      status: lifecycle.interrupted
+        ? "interrupted"
+        : lifecycle.code === 0
+          ? "completed"
+          : "failed",
+      mode: lifecycle.mode || existing.mode || "-",
+      itemIds: [...(lifecycle.itemIds || existing.itemIds || [])],
+      endedAt: at,
+      code: lifecycle.code ?? null,
+      signal: lifecycle.signal || null,
+      interrupted: Boolean(lifecycle.interrupted),
+    };
+  }
+  return next;
+}
+
+function formatRunElapsed(startedAt, endedAt = null, now = Date.now()) {
+  const start = Date.parse(startedAt || "");
+  if (!Number.isFinite(start)) {
+    return "00:00";
+  }
+  const end = endedAt ? Date.parse(endedAt) : Number(now);
+  const elapsed = Math.max(0, (Number.isFinite(end) ? end : Number(now)) - start);
+  const totalSeconds = Math.floor(elapsed / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours > 0
+    ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatBackoffRemaining(backoffUntil, now = Date.now()) {
+  const end = Date.parse(backoffUntil || "");
+  if (!Number.isFinite(end)) {
+    return null;
+  }
+  const remainingSeconds = Math.max(0, Math.ceil((end - now) / 1000));
+  if (remainingSeconds === 0) {
+    return null;
+  }
+  const hours = Math.floor(remainingSeconds / 3600);
+  const minutes = Math.floor((remainingSeconds % 3600) / 60);
+  const seconds = remainingSeconds % 60;
+  return hours > 0
+    ? `${hours}h ${String(minutes).padStart(2, "0")}m`
+    : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function runEventTime(timestamp) {
+  if (!timestamp) {
+    return "--:--:--";
+  }
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return "--:--:--";
+  }
+  return date.toISOString().slice(11, 19);
 }
 
 function terminalSizeState(width, height) {
@@ -230,16 +381,70 @@ function appendProjectedLog(logs, value, maximumEntries = 250) {
 }
 
 function projectRunEvent(state, notification) {
-  const next = {
-    statuses: { ...(state.statuses || {}) },
-    logs: [...(state.logs || [])],
-  };
+  const next = cloneRunProjection(state);
   const event = notification?.event;
   if (!event || typeof event.status !== "string") {
     return next;
   }
   const at = notification.at || new Date().toISOString();
-  for (const id of notification.itemIds || []) {
+  const categories = classifyRunStatus(event.status, event.terminalOutcome);
+  const itemIds = [...(notification.itemIds || [])];
+  next.eventCount += 1;
+  next.pollCount += categories.poll ? 1 : 0;
+  next.availableCount += categories.available ? 1 : 0;
+  next.unavailableCount += categories.unavailable ? 1 : 0;
+  next.actionCount += categories.action ? 1 : 0;
+  next.verificationCount += categories.verification ? 1 : 0;
+  next.errorCount += categories.error ? 1 : 0;
+  next.terminalCount += categories.terminal ? 1 : 0;
+  next.lastEventAt = at;
+  next.lastStatus = event.status;
+  if (Number.isFinite(event.backoffMs) && event.backoffMs > 0) {
+    next.backoffUntil = new Date(
+      Date.parse(at) + event.backoffMs,
+    ).toISOString();
+  } else if (!/backoff/i.test(event.status)) {
+    next.backoffUntil = null;
+  }
+  next.recentEvents = [
+    ...next.recentEvents,
+    {
+      at,
+      retailer: notification.retailer || "worker",
+      itemIds,
+      status: event.status,
+      terminalOutcome: event.terminalOutcome || null,
+      important: Boolean(event.important),
+    },
+  ].slice(-80);
+  for (const id of itemIds) {
+    const previous = next.productStats[id] || {
+      events: 0,
+      polls: 0,
+      available: 0,
+      unavailable: 0,
+      actions: 0,
+      verifications: 0,
+      errors: 0,
+      terminal: 0,
+      lastStatus: null,
+      lastAt: null,
+      terminalOutcome: null,
+    };
+    next.productStats[id] = {
+      ...previous,
+      events: previous.events + 1,
+      polls: previous.polls + (categories.poll ? 1 : 0),
+      available: previous.available + (categories.available ? 1 : 0),
+      unavailable: previous.unavailable + (categories.unavailable ? 1 : 0),
+      actions: previous.actions + (categories.action ? 1 : 0),
+      verifications: previous.verifications + (categories.verification ? 1 : 0),
+      errors: previous.errors + (categories.error ? 1 : 0),
+      terminal: previous.terminal + (categories.terminal ? 1 : 0),
+      lastStatus: event.status,
+      lastAt: at,
+      terminalOutcome: event.terminalOutcome || previous.terminalOutcome || null,
+    };
     next.statuses[id] = {
       status: event.status,
       terminalOutcome: event.terminalOutcome || null,
@@ -260,7 +465,7 @@ function createImportController(store) {
     text: "",
     parsed: null,
     mode: null,
-    armed: false,
+    armed: true,
     error: null,
   };
   return {
@@ -336,6 +541,8 @@ function createDealsTui({
   input = process.stdin,
   output = process.stdout,
   env = process.env,
+  autoStart = true,
+  autoRestartDelayMs = 5000,
   blessed = require("neo-blessed"),
 } = {}) {
   if (!store || !secretStore || typeof runEngine !== "function") {
@@ -366,16 +573,21 @@ function createDealsTui({
     runSetupIndex: 0,
     runSetup: null,
     running: false,
-    runProjection: { statuses: {}, logs: [] },
+    autoRunEnabled: true,
+    runProjection: createRunProjection(),
     notice: "Ready",
     modal: null,
     closed: false,
   };
+  let renderedView = state.view;
 
   let closeResolve;
   const closed = new Promise((resolve) => {
     closeResolve = resolve;
   });
+  let automaticRestartTimer = null;
+  let runStatsTimer = null;
+  let backoffWasVisible = false;
 
   const header = blessed.box({
     parent: screen,
@@ -392,6 +604,7 @@ function createDealsTui({
   });
   const navigation = blessed.list({
     parent: screen,
+    name: "navigation",
     top: 3,
     left: 0,
     width: 20,
@@ -404,7 +617,7 @@ function createDealsTui({
       bg: palette.panel,
       fg: palette.muted,
       border: { fg: palette.panelAlt },
-      selected: { bg: palette.gold, fg: palette.background, bold: true },
+      selected: selectionStyle(state.focus === "navigation"),
       item: { fg: palette.text },
     },
   });
@@ -462,6 +675,46 @@ function createDealsTui({
     return state.items[state.selectedIndex] || null;
   }
 
+  function clearAutomaticRestart() {
+    if (automaticRestartTimer) {
+      clearTimeout(automaticRestartTimer);
+      automaticRestartTimer = null;
+    }
+  }
+
+  function hasTerminalRunOutcome() {
+    return Object.values(state.runProjection.statuses || {}).some(
+      (status) => status?.terminalOutcome,
+    );
+  }
+
+  function scheduleAutomaticRestart() {
+    if (
+      !state.autoRunEnabled ||
+      state.closed ||
+      state.running ||
+      automaticRestartTimer ||
+      hasTerminalRunOutcome()
+    ) {
+      return;
+    }
+    const delay = Math.max(0, Number(autoRestartDelayMs) || 0);
+    state.notice = delay > 0
+      ? `Worker stopped; retrying in ${Math.ceil(delay / 1000)}s.`
+      : "Worker stopped; retrying.";
+    render();
+    automaticRestartTimer = setTimeout(() => {
+      automaticRestartTimer = null;
+      if (!state.autoRunEnabled || state.closed || state.running) {
+        return;
+      }
+      startConfiguredRun({ automatic: true }).catch((error) => {
+        state.notice = `Automatic run failed: ${error.message}`;
+        render();
+      });
+    }, delay);
+  }
+
   function retainSelection() {
     const retainedIndex = state.items.findIndex(
       (item) => item.id === state.selectedProductId,
@@ -492,7 +745,7 @@ function createDealsTui({
   }
 
   function updateChrome() {
-    const armed = state.items.filter((item) => item.armed).length;
+    const selected = state.items.filter((item) => item.armed).length;
     const solver = state.runSetup?.challengeSolver ??
       state.settings.solverEnabled !== false;
     const mode = state.running
@@ -501,10 +754,10 @@ function createDealsTui({
     header.setContent(
       `{bold}{${palette.gold}-fg}PokemonDeals{/${palette.gold}-fg}{/bold}` +
       `  {${palette.cyan}-fg}${state.items.length} products{/${palette.cyan}-fg}` +
-      `  ${armed} armed  Mode: ${mode}  Solver: ${solver ? "on" : "off"}\n` +
+      `  ${selected} selected  Mode: ${mode}  Solver: ${solver ? "on" : "off"}\n` +
       `{${palette.muted}-fg}${state.notice}{/${palette.muted}-fg}`,
     );
-    const base = "arrows/j/k move  Enter open  Space arm  a add  e edit  i import  d delete  r run  s settings";
+    const base = "arrows/j/k move  Enter open  Space include  a add  e edit  i import  d delete  r run  t stats  s settings";
     const suffix = state.running
       ? "  Ctrl+C stop"
       : "  Esc back  q quit";
@@ -530,7 +783,7 @@ function createDealsTui({
         content:
           `{bold}{${palette.gold}-fg}No products yet{/${palette.gold}-fg}{/bold}\n\n` +
           "Press {bold}a{/bold} to add one product or {bold}i{/bold} to paste a grouped list.\n" +
-          `{${palette.muted}-fg}Nothing can run until a supported product is armed.{/${palette.muted}-fg}`,
+          `{${palette.muted}-fg}Only included products are considered when a run starts.{/${palette.muted}-fg}`,
         style: {
           bg: palette.panel,
           fg: palette.text,
@@ -572,7 +825,7 @@ function createDealsTui({
       style: {
         bg: palette.background,
         fg: palette.text,
-        selected: { bg: palette.panelAlt, fg: palette.gold, bold: true },
+        selected: selectionStyle(state.focus === "content"),
       },
     });
     table.select(state.selectedIndex);
@@ -636,7 +889,7 @@ function createDealsTui({
       style: {
         bg: palette.background,
         fg: palette.text,
-        selected: { bg: palette.panelAlt, fg: palette.gold, bold: true },
+        selected: selectionStyle(state.focus === "content"),
       },
       scrollbar: { ch: " ", style: { bg: palette.gold } },
     });
@@ -666,7 +919,7 @@ function createDealsTui({
       style: {
         bg: palette.background,
         fg: palette.text,
-        selected: { bg: palette.panelAlt, fg: palette.gold, bold: true },
+        selected: selectionStyle(state.focus === "content"),
       },
     });
     list.select(state.secretsIndex);
@@ -709,10 +962,12 @@ function createDealsTui({
         "  Esc              Close modal or return to Products",
         "",
         `{${palette.gold}-fg}Products{/${palette.gold}-fg}`,
-        "  Space arm/disarm   a add   e edit   i import   d delete",
+        "  Space include/exclude   a add   e edit   i import   d delete",
+        "  Add only asks for URL and mode; name/group metadata is generated automatically.",
+        "  Included products are monitored when a run starts; inclusion alone does not place an order.",
         "",
         `{${palette.gold}-fg}Control plane{/${palette.gold}-fg}`,
-        "  r run setup   s settings   q quit   Ctrl+C stop active worker",
+        "  r run setup   t live stats   s settings   q quit   Ctrl+C stop active worker",
         "",
         `{${palette.cyan}-fg}Run modes{/${palette.cyan}-fg}`,
         "  Observe: no purchase input.",
@@ -726,19 +981,19 @@ function createDealsTui({
   function renderRunSetup() {
     clearMain();
     const setup = state.runSetup;
-    titleBox("RUN SETUP", "Review armed products and choose execution behavior");
+    titleBox("RUN SETUP", "Review included products and choose execution behavior");
     const productSummary = setup.products.length
       ? setup.products.map((item) =>
         `${item.mode.padEnd(9)} ${retailerLabel(item.retailer).padEnd(10)} ${item.name}`,
       ).join("\n")
-      : "No products are armed. Return to Products and press Space.";
+      : "No products are included. Return to Products and press Space.";
     blessed.box({
       parent: main,
       top: 3,
       left: 3,
       right: 3,
       height: Math.min(9, Math.max(4, setup.products.length + 2)),
-      label: " Armed products ",
+      label: " Included products ",
       border: { type: "line" },
       padding: { left: 1, right: 1 },
       content: productSummary,
@@ -772,7 +1027,7 @@ function createDealsTui({
         fg: palette.text,
         border: { fg: palette.cyan },
         label: { fg: palette.cyan },
-        selected: { bg: palette.panelAlt, fg: palette.gold, bold: true },
+        selected: selectionStyle(state.focus === "content"),
       },
     });
     list.select(state.runSetupIndex);
@@ -780,15 +1035,28 @@ function createDealsTui({
 
   function renderRunView() {
     clearMain();
+    const backoffRemaining = formatBackoffRemaining(
+      state.runProjection.backoffUntil,
+    );
     titleBox("RUN ENGINE", state.running
-      ? "Worker active - Ctrl+C stops the child safely"
-      : "Run complete - Esc returns to Products");
+      ? backoffRemaining
+        ? `Verification backoff - next refresh in ${backoffRemaining}`
+        : "Worker active - Ctrl+C stops the child safely"
+      : automaticRestartTimer
+        ? "Worker unavailable - retrying automatically"
+        : "Run complete - Esc returns to Products");
     const rows = state.runSetup.products.map((item) => {
       const projected = state.runProjection.statuses[item.id];
       const status = projected?.status || item.lastStatus;
-      const outcome = projected?.terminalOutcome || item.terminalOutcome || "-";
+      const outcome = projected
+        ? projected.terminalOutcome || "-"
+        : item.terminalOutcome || "-";
+      const displayStatus = backoffRemaining &&
+        /verification backoff/i.test(status || "")
+        ? `${status} (${backoffRemaining})`
+        : status;
       return `${modeLabel(item.mode).padEnd(10)} ${item.name.padEnd(32)} ` +
-        `${truncateText(status, 35).padEnd(35)} ${outcome}`;
+        `${truncateText(displayStatus, 35).padEnd(35)} ${outcome}`;
     });
     blessed.list({
       parent: main,
@@ -817,6 +1085,7 @@ function createDealsTui({
       border: { type: "line" },
       label: " Event log ",
       tags: false,
+      content: state.runProjection.logs.join("\n"),
       scrollable: true,
       alwaysScroll: true,
       scrollbar: { ch: " ", style: { bg: palette.cyan } },
@@ -827,8 +1096,214 @@ function createDealsTui({
         label: { fg: palette.cyan },
       },
     });
-    log.setContent(state.runProjection.logs.join("\n"));
     log.setScrollPerc(100);
+  }
+
+  function renderRunStats() {
+    clearMain();
+    const projection = state.runProjection;
+    const products = state.runSetup?.products || [];
+    const terminalProducts = products.filter((item) => {
+      const projected = projection.statuses[item.id];
+      return projected
+        ? Boolean(projected.terminalOutcome)
+        : Boolean(item.terminalOutcome);
+    }).length;
+    const outcome = projection.outcome;
+    const runStatus = state.running
+      ? "LIVE"
+      : outcome === "failed"
+        ? "FAILED"
+        : outcome === "stopped"
+          ? "STOPPED"
+          : outcome === "completed"
+            ? "COMPLETE"
+            : "IDLE";
+    const statusColorValue = state.running
+      ? palette.cyan
+      : outcome === "failed"
+        ? palette.red
+        : outcome === "stopped"
+          ? palette.orange
+          : outcome === "completed"
+            ? palette.green
+            : palette.muted;
+    titleBox(
+      "RUN STATS",
+      state.running
+        ? formatBackoffRemaining(projection.backoffUntil)
+          ? `Verification backoff - next refresh in ${formatBackoffRemaining(projection.backoffUntil)}`
+          : "Live projection from structured worker events"
+        : "Latest run summary; press t while a worker is active to follow it",
+    );
+
+    const contentWidth = Math.max(50, screen.width - 26);
+    const cardGap = 1;
+    const cardWidth = Math.max(
+      12,
+      Math.floor((contentWidth - cardGap * 3) / 4),
+    );
+    const cards = [
+      {
+        label: "STATUS",
+        value: runStatus,
+        detail: state.runSetup?.executionMode || "No run configured",
+        color: statusColorValue,
+      },
+      {
+        label: "ELAPSED",
+        value: formatRunElapsed(
+          projection.startedAt,
+          projection.endedAt,
+          Date.now(),
+        ),
+        detail: projection.lastEventAt
+          ? `last ${runEventTime(projection.lastEventAt)}`
+          : "waiting for worker",
+        color: palette.cyan,
+      },
+      {
+        label: "PRODUCTS",
+        value: `${terminalProducts}/${products.length}`,
+        detail: "terminal outcomes",
+        color: palette.gold,
+      },
+      {
+        label: "EVENTS",
+        value: String(projection.eventCount),
+        detail: `${projection.pollCount} polls`,
+        color: palette.green,
+      },
+    ];
+    cards.forEach((card, index) => {
+      const left = 2 + index * (cardWidth + cardGap);
+      const box = blessed.box({
+        parent: main,
+        top: 2,
+        left,
+        width: cardWidth,
+        height: 4,
+        border: { type: "line" },
+        label: ` ${card.label} `,
+        content: `${card.value}\n${card.detail}`,
+        padding: { left: 1, right: 1 },
+        style: {
+          bg: palette.panel,
+          fg: card.color,
+          border: { fg: card.color },
+          label: { fg: card.color },
+          bold: true,
+        },
+      });
+      box.name = `run-stat-card-${card.label.toLowerCase()}`;
+    });
+
+    const mainHeight = Math.max(1, screen.height - 6);
+    const feedTop = Math.max(15, mainHeight - 7);
+    const activityWidth = Math.max(28, Math.floor((contentWidth - 1) * 0.62));
+    const eventWidth = Math.max(20, contentWidth - activityWidth - 1);
+    const panelTop = 8;
+    const panelBottom = feedTop - 1;
+    const activityRows = products.map((item) => {
+      const stats = projection.productStats[item.id] || {};
+      const projected = projection.statuses[item.id];
+      const status = projected?.status || item.lastStatus || "Waiting";
+      const nameWidth = Math.max(10, Math.floor(activityWidth * 0.32));
+      const statusWidth = Math.max(
+        12,
+        activityWidth - nameWidth - 16,
+      );
+      return `${truncateText(item.name, nameWidth).padEnd(nameWidth)} ` +
+        `${truncateText(status, statusWidth).padEnd(statusWidth)} ` +
+        `${String(stats.polls || 0).padStart(2)}p ` +
+        `${String(stats.errors || 0).padStart(2)}e`;
+    });
+    blessed.list({
+      parent: main,
+      name: "run-stats-activity",
+      top: panelTop,
+      left: 2,
+      width: activityWidth,
+      bottom: 7,
+      border: { type: "line" },
+      label: " Product activity ",
+      items: activityRows.length ? activityRows : ["No products in the current run."],
+      tags: false,
+      style: {
+        bg: palette.panel,
+        fg: palette.text,
+        border: { fg: palette.gold },
+        label: { fg: palette.gold },
+        selected: { bg: palette.panel, fg: palette.text },
+      },
+      scrollbar: { ch: " ", style: { bg: palette.gold } },
+    });
+
+    const workerStates = Object.values(projection.workers || {})
+      .map((worker) => `${worker.retailer}: ${worker.status}`)
+      .join(", ") || "not started";
+    const eventSummary = [
+      `Polls          ${projection.pollCount}`,
+      `Available      ${projection.availableCount}`,
+      `Unavailable    ${projection.unavailableCount}`,
+      `Actions        ${projection.actionCount}`,
+      `Verification   ${projection.verificationCount}`,
+      `Alerts         ${projection.errorCount}`,
+      `Terminal       ${projection.terminalCount}`,
+      "",
+      `Workers: ${workerStates}`,
+    ].join("\n");
+    blessed.box({
+      parent: main,
+      name: "run-stats-events",
+      top: panelTop,
+      left: 2 + activityWidth + 1,
+      width: eventWidth,
+      bottom: 7,
+      border: { type: "line" },
+      label: " Event breakdown ",
+      content: eventSummary,
+      padding: { left: 1, right: 1 },
+      tags: false,
+      style: {
+        bg: palette.panel,
+        fg: palette.text,
+        border: { fg: palette.cyan },
+        label: { fg: palette.cyan },
+      },
+    });
+
+    const feedWidth = Math.max(20, contentWidth - 2);
+    const feedLines = projection.recentEvents
+      .slice(-Math.max(2, feedTop - 10))
+      .map((event) => {
+        const marker = event.important ? "!" : ">";
+        const retailer = String(event.retailer || "worker").toUpperCase();
+        return `${runEventTime(event.at)} ${marker} ${retailer.padEnd(8)} ` +
+          truncateText(event.status, feedWidth - 19);
+      });
+    const feed = blessed.log({
+      parent: main,
+      name: "run-stats-feed",
+      top: feedTop,
+      left: 2,
+      right: 2,
+      bottom: 1,
+      border: { type: "line" },
+      label: " Live event feed ",
+      content: feedLines.join("\n") || "Waiting for structured worker events...",
+      tags: false,
+      scrollable: true,
+      alwaysScroll: true,
+      scrollbar: { ch: " ", style: { bg: palette.cyan } },
+      style: {
+        bg: palette.background,
+        fg: palette.text,
+        border: { fg: palette.cyan },
+        label: { fg: palette.cyan },
+      },
+    });
+    feed.setScrollPerc(100);
   }
 
   function render() {
@@ -857,11 +1332,19 @@ function createDealsTui({
       renderRunSetup();
     } else if (state.view === "run") {
       renderRunView();
+    } else if (state.view === "run-stats") {
+      renderRunStats();
     }
-    const navIndex = navigationItems.findIndex((item) => item.id === state.view);
-    if (navIndex >= 0) {
+    Object.assign(
+      navigation.style.selected,
+      selectionStyle(state.focus === "navigation"),
+    );
+    const navigationView = state.view === "run" ? "run-setup" : state.view;
+    const navIndex = navigationItems.findIndex((item) => item.id === navigationView);
+    if (navIndex >= 0 && renderedView !== state.view) {
       navigation.select(navIndex);
     }
+    renderedView = state.view;
     updateChrome();
     if (state.modal) {
       state.modal.setFront();
@@ -899,6 +1382,24 @@ function createDealsTui({
     return true;
   }
 
+  function focusModalOffset(modal, offset, currentElement = modal.screen.focused) {
+    modal._refresh?.();
+    const focusable = (modal._children || []).filter(
+      (child) => !child.detached && child.visible,
+    );
+    if (focusable.length === 0) {
+      modal.focus();
+      return;
+    }
+    const current = focusable.indexOf(currentElement);
+    const start = current >= 0 ? current : offset > 0 ? -1 : 0;
+    const next = focusable[
+      (start + offset + focusable.length) % focusable.length
+    ];
+    modal._selected = next;
+    next.focus();
+  }
+
   function bindModalAction(modal, keys, handler) {
     for (const key of keys) {
       modal.modalActions.set(key.toLowerCase(), handler);
@@ -928,7 +1429,13 @@ function createDealsTui({
     });
   }
 
-  async function submitModal(modal, errorWidget, operation, onSuccess) {
+  async function submitModal(
+    modal,
+    errorWidget,
+    operation,
+    onSuccess,
+    afterRefresh = null,
+  ) {
     if (!isActiveModal(modal) || modal.submissionPending) {
       return false;
     }
@@ -941,12 +1448,22 @@ function createDealsTui({
       onSuccess(result);
       modal.submissionPending = false;
       closeModal(modal);
+      let refreshSucceeded = true;
       try {
         await refreshData();
         render();
       } catch (refreshError) {
+        refreshSucceeded = false;
         state.notice = `Catalog refresh failed: ${refreshError.message}`;
         render();
+      }
+      if (refreshSucceeded && typeof afterRefresh === "function") {
+        try {
+          await afterRefresh(result);
+        } catch (followUpError) {
+          state.notice = `Automatic run failed: ${followUpError.message}`;
+          render();
+        }
       }
       return true;
     } catch (submissionError) {
@@ -987,7 +1504,22 @@ function createDealsTui({
     });
     modal.modalActions = new Map();
     modal.submissionPending = false;
+    modal.removeAllListeners("element keypress");
     modal.on("element keypress", (element, _, key) => {
+      if (key?.name === "tab") {
+        if (element.type === "textbox" || element.type === "textarea") {
+          if (!key.shift) {
+            element.emit("keypress", null, { name: "backspace" });
+          }
+          element.cancel?.();
+          if (element._reading) {
+            element.emit("blur", modal);
+          }
+        }
+        focusModalOffset(modal, key.shift ? -1 : 1, element);
+        key.dealsModalHandled = true;
+        return;
+      }
       dispatchModalAction(modal, element, key);
     });
     state.modal = modal;
@@ -1041,14 +1573,18 @@ function createDealsTui({
   function openProductForm(item = null) {
     const modal = modalBox(item ? "Edit product" : "Add product", {
       width: 78,
-      height: 24,
+      height: item ? 24 : 20,
     });
-    const name = formInput(modal, "Name", 1, item?.name || "");
-    const group = formInput(modal, "Group", 4, item?.group || "");
-    const url = formInput(modal, "URL", 7, item?.url || "");
+    const name = item
+      ? formInput(modal, "Name override", 1, item.name || "")
+      : null;
+    const group = item
+      ? formInput(modal, "Group override", 4, item.group || "")
+      : null;
+    const url = formInput(modal, "URL", item ? 7 : 1, item?.url || "");
     blessed.text({
       parent: modal,
-      top: 11,
+      top: item ? 11 : 5,
       left: 1,
       width: 16,
       content: "Mode",
@@ -1056,7 +1592,7 @@ function createDealsTui({
     });
     const modes = blessed.list({
       parent: modal,
-      top: 10,
+      top: item ? 10 : 4,
       left: 18,
       width: 35,
       height: 5,
@@ -1073,33 +1609,64 @@ function createDealsTui({
     });
     const modeIds = ["buy-now", "preorder", "buy"];
     modes.select(Math.max(0, modeIds.indexOf(item?.mode || "buy")));
-    const armed = blessed.checkbox({
-      parent: modal,
-      top: 15,
-      left: 18,
-      width: 25,
-      height: 1,
-      text: "Armed",
-      checked: Boolean(item?.armed),
-      keys: true,
-      style: { bg: palette.panel, fg: palette.text, focus: { fg: palette.gold } },
-    });
-    const error = modalError(modal, 17);
+    if (item) {
+      const included = blessed.checkbox({
+        parent: modal,
+        top: 15,
+        left: 18,
+        width: 40,
+        height: 1,
+        text: "Include in next run",
+        checked: Boolean(item.armed),
+        keys: true,
+        style: { bg: palette.panel, fg: palette.text, focus: { fg: palette.gold } },
+      });
+      blessed.text({
+        parent: modal,
+        top: 16,
+        left: 18,
+        right: 1,
+        content: "Name and group are optional overrides.",
+        style: { bg: palette.panel, fg: palette.muted },
+      });
+      modal.inclusionControl = included;
+    } else {
+      blessed.text({
+        parent: modal,
+        top: 10,
+        left: 18,
+        right: 1,
+        content: "Name and group are generated from the URL.",
+        style: { bg: palette.panel, fg: palette.muted },
+      });
+      blessed.text({
+        parent: modal,
+        top: 11,
+        left: 18,
+        right: 1,
+        content: "This product will be included automatically.\n" +
+          "The configured run starts after saving.",
+        style: { bg: palette.panel, fg: palette.muted },
+      });
+    }
+    const error = modalError(modal, item ? 19 : 13);
     blessed.text({
       parent: modal,
       bottom: 0,
       left: 1,
       right: 1,
-      content: "Tab move  Space toggle  Ctrl+S save  Esc cancel",
+      content: item
+        ? "Tab move  Space toggle  Enter/Ctrl+S save  Esc cancel"
+        : "Tab move  Enter/Ctrl+S save + start  Esc cancel",
       style: { bg: palette.panel, fg: palette.muted },
     });
-    bindModalAction(modal, ["C-s"], () => {
+    const saveProduct = () => {
       const input = {
-        name: name.getValue(),
-        group: group.getValue(),
+        name: name?.getValue() || "",
+        group: group?.getValue() || "",
         url: url.getValue(),
         mode: modeIds[modes.selected],
-        armed: armed.checked,
+        armed: item ? modal.inclusionControl.checked : true,
       };
       return submitModal(
         modal,
@@ -1110,9 +1677,13 @@ function createDealsTui({
           state.notice = `${item ? "Updated" : "Added"} ${saved.name}.`;
           state.view = "products";
         },
+        item ? null : async () => {
+          await startConfiguredRun({ automatic: true });
+        },
       );
-    });
-    name.focus();
+    };
+    bindModalAction(modal, ["enter", "C-s"], saveProduct);
+    (item ? name : url).focus();
     screen.render();
   }
 
@@ -1159,7 +1730,7 @@ function createDealsTui({
         left: 1,
         right: 1,
         height: 2,
-        content: 'Paste headings ending in ":" and products as "Name: URL".',
+        content: 'Optional headings organize products; paste products as "Name: URL".',
         style: { bg: palette.panel, fg: palette.cyan },
       });
       const textarea = blessed.textarea({
@@ -1216,7 +1787,8 @@ function createDealsTui({
         border: { type: "line" },
         label: ` Preview: ${parsed.items.length} products `,
         content: parsed.items.map((item) =>
-          `${item.group ? `[${item.group}] ` : ""}${item.name}\n  ${item.url}`,
+          `${item.group ? `[${item.group}] ` : ""}` +
+          `${item.name || "Name from URL"}\n  ${item.url}`,
         ).join("\n"),
         style: {
           bg: palette.background,
@@ -1247,15 +1819,13 @@ function createDealsTui({
       const selectedMode = controller.state.mode || "buy-now";
       modes.select(Math.max(0, modeIds.indexOf(selectedMode)));
       controller.selectMode(selectedMode);
-      const armed = blessed.checkbox({
-        parent: modal,
-        top: "56%",
-        left: 39,
-        width: 30,
-        text: "Arm imported products",
-        checked: controller.state.armed,
-        keys: true,
-        style: { bg: palette.panel, fg: palette.text, focus: { fg: palette.gold } },
+      blessed.text({
+      parent: modal,
+      top: "56%",
+      left: 39,
+      right: 1,
+      content: "Products will be included automatically.",
+      style: { bg: palette.panel, fg: palette.muted },
       });
       const error = modalError(modal, "100%-5");
       blessed.text({
@@ -1263,7 +1833,7 @@ function createDealsTui({
         bottom: 0,
         left: 1,
         right: 1,
-        content: "arrows select mode  Space armed  Enter import  F2 edit paste  Esc cancel",
+        content: "arrows select mode  Enter import  F2 edit paste  Esc cancel",
         style: { bg: palette.panel, fg: palette.muted },
       });
       modes.on("select item", (_, index) => {
@@ -1275,21 +1845,8 @@ function createDealsTui({
         controller.selectMode(modeIds[index]);
         screen.render();
       });
-      bindModalAction(modal, ["space"], (element) => {
-        if (element === armed) {
-          if (controller.state.armed !== armed.checked) {
-            controller.toggleArmed();
-          }
-        } else {
-          armed.checked = controller.toggleArmed();
-        }
-        screen.render();
-      });
       bindModalAction(modal, ["f2"], renderPaste);
-      bindModalAction(modal, ["enter"], (element) => {
-        if (element === armed && controller.state.armed !== armed.checked) {
-          controller.toggleArmed();
-        }
+      bindModalAction(modal, ["enter"], () => {
         return submitModal(
           modal,
           error,
@@ -1304,12 +1861,7 @@ function createDealsTui({
       bindFocusedModalActions(
         modal,
         modes,
-        ["1", "2", "3", "space", "f2", "enter", "escape"],
-      );
-      bindFocusedModalActions(
-        modal,
-        armed,
-        ["1", "2", "3", "space", "f2", "enter", "escape"],
+        ["1", "2", "3", "f2", "enter", "escape"],
       );
       modes.focus();
       screen.render();
@@ -1325,14 +1877,69 @@ function createDealsTui({
     if (!row) {
       return;
     }
-    const modal = modalBox(`Edit ${row.label}`, { width: 70, height: 12 });
-    const inputBox = formInput(modal, "Value", 2, row.value === "unset" ? "" : row.value);
-    const error = modalError(modal, 6);
+    const property = row.key.slice("target.".length);
+    const options = adapter.settings.options?.(property) || [];
+    const modal = modalBox(`Edit ${row.label}`, {
+      width: options.length > 0 ? "94%" : 70,
+      height: options.length > 0
+        ? Math.max(12, options.length + 9)
+        : 12,
+    });
+    const error = modalError(
+      modal,
+      options.length > 0 ? options.length + 4 : 6,
+    );
+    let choiceList;
+    let inputBox;
+    if (options.length > 0) {
+      blessed.text({
+        parent: modal,
+        top: 0,
+        left: 1,
+        right: 1,
+        content: "Choose a value. Each option explains what it changes.",
+        style: { bg: palette.panel, fg: palette.cyan },
+      });
+      choiceList = blessed.list({
+        parent: modal,
+        top: 2,
+        left: 1,
+        right: 1,
+        height: options.length + 2,
+        keys: true,
+        border: { type: "line" },
+        label: " Options ",
+        items: options.map((option) =>
+          `${option.label.padEnd(24)} ${option.description}`,
+        ),
+        style: {
+          bg: palette.background,
+          fg: palette.text,
+          border: { fg: palette.gold },
+          label: { fg: palette.gold },
+          selected: { bg: palette.gold, fg: palette.background },
+          focus: { border: { fg: palette.cyan } },
+        },
+      });
+      const selected = options.findIndex((option) =>
+        String(option.value === null ? "unset" : option.value) === row.value,
+      );
+      choiceList.select(selected >= 0 ? selected : 0);
+    } else {
+      inputBox = formInput(
+        modal,
+        "Value",
+        2,
+        row.value === "unset" ? "" : row.value,
+      );
+    }
     blessed.text({
       parent: modal,
       bottom: 0,
       left: 1,
-      content: `${row.key}  |  Enter save  Esc cancel`,
+      content: options.length > 0
+        ? `${row.key}  |  arrows choose  Enter save  Esc cancel`
+        : `${row.key}  |  Enter save  Esc cancel`,
       style: { bg: palette.panel, fg: palette.muted },
     });
     bindModalAction(modal, ["enter"], () =>
@@ -1341,14 +1948,21 @@ function createDealsTui({
         error,
         () => store.setSetting(
           "target",
-          row.key.slice("target.".length),
-          inputBox.getValue(),
+          property,
+          options.length > 0
+            ? options[choiceList.selected]?.value
+            : inputBox.getValue(),
         ),
         () => {
           state.notice = `Updated ${row.key}.`;
         },
       ));
-    inputBox.focus();
+    if (choiceList) {
+      bindFocusedModalActions(modal, choiceList, ["enter", "escape"]);
+      choiceList.focus();
+    } else {
+      inputBox.focus();
+    }
     screen.render();
   }
 
@@ -1460,8 +2074,8 @@ function createDealsTui({
         `${modeLabel(item.mode)} | ${retailerLabel(item.retailer)} | ${item.name}`,
       ),
       "",
-      `Maximum item price: ${settings.maxItemPrice || "NOT SET"}`,
-      `Maximum order total: ${settings.maxOrderTotal || "NOT SET"}`,
+      `Maximum item price: ${settings.maxItemPrice || "unlimited"}`,
+      `Maximum order total: ${settings.maxOrderTotal || "unlimited"}`,
       `Expected fulfillment: ${settings.expectedFulfillment || "any detected"}`,
       `Challenge solver: ${state.runSetup.challengeSolver ? "enabled" : "disabled"}`,
     ].join("\n");
@@ -1505,26 +2119,29 @@ function createDealsTui({
       state.runProjection.logs,
       line,
     );
-    if (state.view === "run") {
+    if (state.view === "run" || state.view === "run-stats") {
       render();
     }
   }
 
   async function beginRun() {
     if (state.runSetup.products.length === 0) {
-      state.notice = "No products are armed.";
+      state.notice = "No products are included.";
       render();
       return;
     }
     state.running = true;
     state.view = "run";
-    state.runProjection = { statuses: {}, logs: [] };
+    state.runProjection = createRunProjection();
+    state.runProjection.startedAt = new Date().toISOString();
     state.notice = `Running ${state.runSetup.executionMode}.`;
     render();
     const outputSink = createChunkLogSink(appendRunLog);
     const errorSink = createChunkLogSink(appendRunLog, "ERROR: ");
+    let runResult = { code: 1, signal: null, interrupted: false };
+    let retryableFailure = false;
     try {
-      const result = await runEngine(
+      runResult = await runEngine(
         store,
         state.runSetup.executionMode,
         {
@@ -1534,6 +2151,7 @@ function createDealsTui({
             },
           },
           secretStore,
+          ensureCdp: true,
           output: outputSink,
           errorOutput: errorSink,
           onRunEvent(notification) {
@@ -1544,6 +2162,10 @@ function createDealsTui({
             render();
           },
           onLifecycle(event) {
+            state.runProjection = projectRunLifecycle(
+              state.runProjection,
+              event,
+            );
             appendRunLog(
               `${event.retailer || "engine"}: ${event.type}` +
               (event.mode ? ` (${event.mode})` : ""),
@@ -1553,19 +2175,36 @@ function createDealsTui({
       );
       outputSink.flush();
       errorSink.flush();
-      state.notice = result.interrupted
+      state.notice = runResult.interrupted
         ? "Run stopped by operator."
-        : result.code === 0
+        : runResult.code === 0
           ? "Run completed."
-          : `Run failed with exit code ${result.code}.`;
+          : `Run failed with exit code ${runResult.code}.`;
     } catch (error) {
+      retryableFailure = Boolean(error.retryable);
       appendRunLog(`CONTROL PLANE ERROR: ${safeLogLine(error.message)}`);
       state.notice = `Run failed: ${error.message}`;
     } finally {
       state.running = false;
+      state.runProjection = {
+        ...state.runProjection,
+        endedAt: state.runProjection.endedAt || new Date().toISOString(),
+        outcome: runResult.interrupted
+          ? "stopped"
+          : runResult.code === 0
+            ? "completed"
+            : "failed",
+      };
       await refreshData();
-      state.view = "run";
+      state.view = state.view === "run-stats" ? "run-stats" : "run";
       render();
+      if (
+        retryableFailure &&
+        !runResult.interrupted &&
+        !hasTerminalRunOutcome()
+      ) {
+        scheduleAutomaticRestart();
+      }
     }
   }
 
@@ -1581,8 +2220,28 @@ function createDealsTui({
       render();
       return;
     }
+    await startConfiguredRun();
+  }
+
+  async function startConfiguredRun({ automatic = false } = {}) {
+    if (automatic && !state.autoRunEnabled) {
+      return;
+    }
+    clearAutomaticRestart();
+    if (!automatic) {
+      state.autoRunEnabled = true;
+    }
+    if (!state.runSetup || state.runSetup.products.length === 0) {
+      state.notice = "No products are included.";
+      render();
+      return;
+    }
     if (state.runSetup.executionMode === "live-purchase") {
-      openLiveConfirmation();
+      if (automatic) {
+        await beginRun();
+      } else {
+        openLiveConfirmation();
+      }
     } else {
       await beginRun();
     }
@@ -1648,6 +2307,7 @@ function createDealsTui({
     if (state.focus === "navigation") {
       await openView(navigationItems[navigation.selected].id);
       state.focus = "content";
+      render();
       return;
     }
     if (state.view === "products" && currentItem()) {
@@ -1666,6 +2326,11 @@ function createDealsTui({
       return;
     }
     state.closed = true;
+    clearAutomaticRestart();
+    if (runStatsTimer) {
+      clearInterval(runStatsTimer);
+      runStatsTimer = null;
+    }
     screen.destroy();
     closeResolve();
   }
@@ -1674,9 +2339,24 @@ function createDealsTui({
     if (state.modal) {
       return;
     }
+    if (action === "stop-run" && !state.running) {
+      state.autoRunEnabled = false;
+      clearAutomaticRestart();
+      state.notice = "Automatic runs stopped. Press r to start again.";
+      render();
+      return;
+    }
     if (state.running) {
       if (action === "stop-run") {
+        state.autoRunEnabled = false;
+        clearAutomaticRestart();
         process.emit("SIGINT");
+      } else if (action === "run-stats") {
+        state.view = "run-stats";
+        render();
+      } else if (action === "back" && state.view === "run-stats") {
+        state.view = "run";
+        render();
       } else if (action === "quit" || action === "back" || action === "run") {
         state.notice = "A worker is active. Press Ctrl+C to stop it safely.";
         render();
@@ -1702,10 +2382,10 @@ function createDealsTui({
       try {
         const item = currentItem();
         await store.setArmed([item.id], !item.armed);
-        state.notice = `${item.name} is now ${item.armed ? "disarmed" : "armed"}.`;
+        state.notice = `${item.name} is now ${item.armed ? "excluded" : "included"}.`;
         await refreshData();
       } catch (error) {
-        state.notice = `Cannot change armed state: ${error.message}`;
+        state.notice = `Cannot change run inclusion: ${error.message}`;
       }
       render();
     } else if (action === "add") {
@@ -1718,6 +2398,8 @@ function createDealsTui({
       openDeleteModal(currentItem());
     } else if (action === "run") {
       await openView("run-setup");
+    } else if (action === "run-stats") {
+      await openView("run-stats");
     } else if (action === "settings") {
       await openView("settings");
     } else if (action === "clear-secret" && state.view === "secrets") {
@@ -1747,7 +2429,30 @@ function createDealsTui({
 
   const ready = refreshData()
     .then(() => {
+      runStatsTimer = setInterval(() => {
+        const backoffVisible = Boolean(
+          formatBackoffRemaining(state.runProjection.backoffUntil),
+        );
+        if (
+          !state.closed &&
+          state.running &&
+          (backoffVisible || backoffWasVisible) &&
+          (state.view === "run" || state.view === "run-stats")
+        ) {
+          if (!backoffVisible) {
+            state.runProjection.backoffUntil = null;
+          }
+          render();
+        }
+        backoffWasVisible = backoffVisible;
+      }, 1000);
       render();
+      if (autoStart && state.runSetup.products.length > 0) {
+        startConfiguredRun({ automatic: true }).catch((error) => {
+          state.notice = `Automatic run failed: ${error.message}`;
+          render();
+        });
+      }
       return state;
     })
     .catch((error) => {
@@ -1788,7 +2493,9 @@ module.exports = {
   createChunkLogSink,
   createDealsTui,
   createImportController,
+  createRunProjection,
   executionModeOptions,
+  formatRunElapsed,
   launchDealsTui,
   minimumTerminalSize,
   navigationItems,
@@ -1796,6 +2503,7 @@ module.exports = {
   productDetail,
   productTableHeader,
   productRows,
+  projectRunLifecycle,
   projectRunEvent,
   runSetupDefaults,
   safeLogLine,

@@ -142,6 +142,59 @@ function wait(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
+function invalidateAvailabilityRequest(job) {
+  job.availabilityRequest = null;
+  job.challengeSignal = null;
+  job.lastSummary = null;
+  job.lastFingerprint = null;
+  job.nextNavigationAt = 0;
+}
+
+async function waitForPausedPages(
+  jobs,
+  monitorState,
+  {
+    inspect = inspectChallenge,
+    waitFor = wait,
+    intervalMs = 1000,
+  } = {},
+) {
+  while (monitorState.isPaused()) {
+    if (!monitorState.isChallengePaused()) {
+      await waitFor(monitorState.remainingPauseMs());
+      return false;
+    }
+    const pausedProductIds = monitorState.challengePauseProductIds();
+    for (const job of jobs) {
+      if (job.completed || job.terminal) {
+        continue;
+      }
+      if (
+        pausedProductIds.length > 0 &&
+        !pausedProductIds.includes(job.product.id)
+      ) {
+        continue;
+      }
+      let detection;
+      try {
+        detection = await inspect(job.page);
+      } catch (error) {
+        detection = null;
+      }
+      if (detection && !detection.detected && !detection.unreadable) {
+        invalidateAvailabilityRequest(job);
+        if (!monitorState.releaseChallengeProduct(job.product.id)) {
+          continue;
+        }
+        console.log(`TARGET_CHALLENGE_PAGE_CLEARED product=${job.product.id}`);
+        return true;
+      }
+    }
+    await waitFor(Math.min(intervalMs, monitorState.remainingPauseMs()));
+  }
+  return false;
+}
+
 function parseJobArgument(value) {
   const input = String(value || "").trim();
   if (/^https:\/\//i.test(input)) {
@@ -367,12 +420,20 @@ async function handleChallenge(job, monitorState, reason, {
     if (!assumeDetected) {
       return "clear";
     }
-    monitorState.pauseForChallenge(`${reason} (no page-level evidence)`);
+    invalidateAvailabilityRequest(job);
+    monitorState.pauseForChallenge(
+      `${reason} (no page-level evidence)`,
+      { fixed: true, productId: job.product.id },
+    );
     return "blocked";
   }
 
   if (detection.unreadable) {
-    monitorState.pauseForChallenge(`${reason} (unreadable page state)`);
+    invalidateAvailabilityRequest(job);
+    monitorState.pauseForChallenge(
+      `${reason} (unreadable page state)`,
+      { fixed: true, productId: job.product.id },
+    );
     return "blocked";
   }
 
@@ -380,7 +441,11 @@ async function handleChallenge(job, monitorState, reason, {
     `TARGET_CHALLENGE_DETECTED kind=${detection.kind} product=${job.product.id} reason=${reason}`,
   );
   if (!solver) {
-    monitorState.pauseForChallenge(`${reason} (${detection.kind}, no solver)`);
+    invalidateAvailabilityRequest(job);
+    monitorState.pauseForChallenge(
+      `${reason} (${detection.kind}, no solver)`,
+      { productId: job.product.id },
+    );
     return "blocked";
   }
 
@@ -416,8 +481,10 @@ async function handleChallenge(job, monitorState, reason, {
     return "resolved";
   }
 
+  invalidateAvailabilityRequest(job);
   monitorState.pauseForChallenge(
     `${reason} (${detection.kind}, solve ${result.outcome}${result.error ? `: ${result.error}` : ""})`,
+    { productId: job.product.id },
   );
   return "blocked";
 }
@@ -530,7 +597,10 @@ async function attachResponseMonitor(job, monitorState) {
         // Defer to the poll loop so the solve runs in a controlled, serialized step.
         job.challengeSignal = reason;
       } else {
-        monitorState.pauseForChallenge(reason);
+        invalidateAvailabilityRequest(job);
+        monitorState.pauseForChallenge(reason, {
+          productId: job.product.id,
+        });
       }
       return;
     }
@@ -1100,6 +1170,8 @@ function createMonitorState({
 } = {}) {
   let challengeAttempt = 0;
   let pausedUntil = 0;
+  let pauseKind = null;
+  let pausedProductIds = new Set();
   let mutationQueue = Promise.resolve();
   let calibrationStopped = false;
   let challengePending = false;
@@ -1154,23 +1226,36 @@ function createMonitorState({
     isPaused() {
       return now() < pausedUntil;
     },
+    isChallengePaused() {
+      return pauseKind === "challenge" && now() < pausedUntil;
+    },
+    challengePauseProductIds() {
+      return [...pausedProductIds];
+    },
     remainingPauseMs() {
       return Math.max(0, pausedUntil - now());
     },
     remainingRuntimeMs() {
       return runtimeMs > 0 ? Math.max(0, startedAt + runtimeMs - now()) : Infinity;
     },
-    pauseForChallenge(reason) {
+    pauseForChallenge(reason, { fixed = false, productId = null } = {}) {
       if (now() < pausedUntil) {
+        if (pauseKind === "challenge" && productId) {
+          pausedProductIds.add(productId);
+        }
         return;
       }
-      const delay = calculateBackoffMs(
-        challengeAttempt,
-        challengeBaseDelayMs,
-        challengeMaximumDelayMs,
-      );
+      const delay = fixed
+        ? challengeBaseDelayMs
+        : calculateBackoffMs(
+          challengeAttempt,
+          challengeBaseDelayMs,
+          challengeMaximumDelayMs,
+        );
       challengeAttempt += 1;
       pausedUntil = now() + delay;
+      pauseKind = "challenge";
+      pausedProductIds = productId ? new Set([productId]) : new Set();
       calibrationStopped ||= observe;
       error(`TARGET_CHALLENGE_BACKOFF ${delay}ms ${reason}`);
       if (!observe) {
@@ -1195,6 +1280,8 @@ function createMonitorState({
       const delay = Math.max(backoff, retryAfterMs || 0);
       challengeAttempt += 1;
       pausedUntil = now() + delay;
+      pauseKind = "rate-limit";
+      pausedProductIds = new Set();
       calibrationStopped ||= observe;
       error(`TARGET_RATE_LIMIT_BACKOFF ${delay}ms ${reason}`);
       if (!observe) {
@@ -1203,15 +1290,48 @@ function createMonitorState({
         );
       }
     },
-    clearChallengeBackoff() {
-      if (pausedUntil > 0 && now() >= pausedUntil) {
+    clearChallengeBackoff(force = false) {
+      if (pausedUntil > 0 && (force || now() >= pausedUntil)) {
         pausedUntil = 0;
+        pauseKind = null;
+        pausedProductIds = new Set();
+        if (force) {
+          challengeAttempt = 0;
+          challengePending = false;
+        }
       }
     },
+    releaseChallengeProduct(productId) {
+      if (pauseKind !== "challenge") {
+        return true;
+      }
+      if (pausedProductIds.size === 0) {
+        this.clearChallengeBackoff(true);
+        return true;
+      }
+      pausedProductIds.delete(productId);
+      if (pausedProductIds.size === 0) {
+        this.clearChallengeBackoff(true);
+        return true;
+      }
+      return false;
+    },
     recordChallengeSolved(kind, attempts, productId = null) {
-      challengeAttempt = 0;
-      pausedUntil = 0;
-      challengePending = false;
+      if (productId && pausedProductIds.size > 0) {
+        pausedProductIds.delete(productId);
+        if (pausedProductIds.size === 0) {
+          challengeAttempt = 0;
+          pausedUntil = 0;
+          pauseKind = null;
+          challengePending = false;
+        }
+      } else {
+        challengeAttempt = 0;
+        pausedUntil = 0;
+        pauseKind = null;
+        pausedProductIds = new Set();
+        challengePending = false;
+      }
       // Never clear calibrationStopped: unrelated errors and normal observe-only
       // stop-on-challenge behavior remain terminal, even if a solver later succeeds.
       challengeSolves.push({
@@ -1352,7 +1472,7 @@ async function main() {
     throw new Error("TARGET_CHALLENGE_VALIDATE requires observe-only mode and a configured solver.");
   }
   const purchaseGuardConfig = readPurchaseGuardConfig(process.env, {
-    required: !observeOnly,
+    required: false,
   });
   if (!observeOnly) {
     await verifyDiscordConfiguration();
@@ -1417,7 +1537,11 @@ async function main() {
           monitorState.remainingRuntimeMs(),
         );
         console.log(`TARGET_MONITOR_PAUSED ${delay}ms`);
-        await wait(delay);
+        if (monitorState.isChallengePaused()) {
+          await waitForPausedPages(jobs, monitorState);
+        } else {
+          await wait(delay);
+        }
         monitorState.clearChallengeBackoff();
         continue;
       }
@@ -1482,4 +1606,5 @@ module.exports = {
   reconcilePendingCart,
   resolveProductArgs,
   triggerPurchase,
+  waitForPausedPages,
 };

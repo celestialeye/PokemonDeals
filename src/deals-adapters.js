@@ -1,6 +1,6 @@
 const path = require("node:path");
 const targetProducts = require("../data/target-products.json");
-const { normalizeUrl } = require("./deals-core");
+const { normalizeUrl, suggestedProductName } = require("./deals-core");
 const {
   applyStoredSecretsToEnvironment,
 } = require("./deals-secrets");
@@ -9,6 +9,7 @@ const {
   normalizeExecutionMode,
   normalizeTargetSettings,
   setTargetSetting,
+  targetSettingOptions,
   targetSettingRows,
   targetSettingsDefaults,
   validateTargetSettingsForRun,
@@ -21,7 +22,9 @@ const executionModes = Object.freeze([
 ]);
 
 const knownTargetUrls = new Map();
+const knownTargetProducts = new Map();
 for (const product of targetProducts) {
+  knownTargetProducts.set(product.id, product);
   for (const value of [product.url, product.shortUrl]) {
     if (value) {
       knownTargetUrls.set(normalizeUrl(value), product);
@@ -70,13 +73,122 @@ function normalizeTargetUrl(value) {
 
 function targetMetadata(value) {
   const url = normalizeTargetUrl(value);
-  const known = knownTargetUrls.get(url);
   const directId = targetProductIdFromUrl(url);
+  const known = knownTargetUrls.get(url) ||
+    (directId ? knownTargetProducts.get(directId) : null);
   return {
     retailer: "target",
     normalizedUrl: url,
+    name: known?.name ||
+      suggestedProductName(
+        url,
+        directId ? `Target ${directId}` : "Target product",
+      ),
+    nameSource: known?.name ? "known" : "url",
     resolvedProductId: directId || known?.id || null,
     resolvedUrl: directId ? url : known?.url || null,
+  };
+}
+
+function decodeHtmlEntities(value) {
+  const named = {
+    amp: "&",
+    apos: "'",
+    gt: ">",
+    lt: "<",
+    nbsp: " ",
+    quot: "\"",
+  };
+  return String(value || "")
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) =>
+      String.fromCodePoint(Number.parseInt(code, 16)))
+    .replace(/&#(\d+);/g, (_, code) =>
+      String.fromCodePoint(Number.parseInt(code, 10)))
+    .replace(/&([a-z]+);/gi, (match, name) => named[name.toLowerCase()] || match);
+}
+
+function cleanRetrievedProductName(value) {
+  const cleaned = decodeHtmlEntities(String(value || ""))
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\s*[|–—-]\s*(?:Target|Target\.com)\s*$/i, "")
+    .trim();
+  if (
+    !cleaned ||
+    /^(?:target(?:\.com)?|page not found|error|access denied)$/i.test(cleaned)
+  ) {
+    return null;
+  }
+  return cleaned;
+}
+
+function htmlAttribute(tag, attribute) {
+  const match = String(tag || "").match(
+    new RegExp(`${attribute}\\s*=\\s*["']([^"']+)["']`, "i"),
+  );
+  return match ? decodeHtmlEntities(match[1]) : null;
+}
+
+function extractProductNameFromHtml(html) {
+  const tags = String(html || "").match(/<meta\b[^>]*>/gi) || [];
+  for (const tag of tags) {
+    const property = htmlAttribute(tag, "property") ||
+      htmlAttribute(tag, "name");
+    if (!/^(?:og:title|twitter:title)$/i.test(property || "")) {
+      continue;
+    }
+    const name = cleanRetrievedProductName(htmlAttribute(tag, "content"));
+    if (name) {
+      return name;
+    }
+  }
+
+  const title = String(html || "").match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+  return cleanRetrievedProductName(title?.[1]);
+}
+
+async function resolveProductMetadata(value, {
+  fetchImpl = globalThis.fetch,
+  timeoutMs = 10000,
+} = {}) {
+  const initial = productMetadata(value);
+  if (
+    initial.retailer === "unsupported" ||
+    initial.nameSource === "known" ||
+    typeof fetchImpl !== "function"
+  ) {
+    return initial;
+  }
+
+  let response;
+  try {
+    response = await fetchImpl(initial.normalizedUrl, {
+      redirect: "follow",
+      headers: {
+        accept: "text/html,application/xhtml+xml",
+        "user-agent": "PokemonDeals/1.0",
+      },
+      signal: typeof AbortSignal?.timeout === "function"
+        ? AbortSignal.timeout(timeoutMs)
+        : undefined,
+    });
+  } catch (error) {
+    return initial;
+  }
+
+  const finalUrl = response?.url ? normalizeUrl(response.url) : null;
+  const finalMetadata = finalUrl ? productMetadata(finalUrl) : null;
+  const pageName = typeof response?.text === "function"
+    ? extractProductNameFromHtml(await response.text())
+    : null;
+  return {
+    ...initial,
+    name: pageName || finalMetadata?.name || initial.name,
+    resolvedProductId:
+      finalMetadata?.resolvedProductId || initial.resolvedProductId,
+    resolvedUrl: finalMetadata?.resolvedUrl || initial.resolvedUrl,
+    nameSource: pageName ? "page" : finalMetadata?.nameSource || initial.nameSource,
   };
 }
 
@@ -243,6 +355,16 @@ function parseTargetOutput(line) {
     };
   }
 
+  const challengeCleared = value.match(
+    /^TARGET_CHALLENGE_PAGE_CLEARED\b.*\bproduct=(A-\d{7,})\b/i,
+  );
+  if (challengeCleared) {
+    return {
+      productId: challengeCleared[1].toUpperCase(),
+      status: "Verification cleared",
+    };
+  }
+
   if (/^TARGET_CHALLENGE_BACKOFF\b/i.test(value)) {
     const productMatch = value.match(/\bA-\d{7,}\b/i);
     return {
@@ -250,6 +372,16 @@ function parseTargetOutput(line) {
         ? { productId: productMatch[0].toUpperCase() }
         : { scope: "all" }),
       status: "Verification backoff",
+      important: true,
+    };
+  }
+
+  const monitorPause = value.match(/^TARGET_MONITOR_PAUSED\s+(\d+)ms\b/i);
+  if (monitorPause) {
+    return {
+      scope: "all",
+      status: "Verification backoff",
+      backoffMs: Number.parseInt(monitorPause[1], 10),
       important: true,
     };
   }
@@ -302,6 +434,7 @@ const targetAdapter = Object.freeze({
     defaults: targetSettingsDefaults,
     normalize: normalizeTargetSettings,
     set: setTargetSetting,
+    options: targetSettingOptions,
     rows: targetSettingRows,
     validateRun: validateTargetSettingsForRun,
   }),
@@ -335,6 +468,8 @@ function productMetadata(value) {
     : {
       retailer: "unsupported",
       normalizedUrl: url,
+      name: suggestedProductName(url),
+      nameSource: "url",
       resolvedProductId: null,
       resolvedUrl: null,
     };
@@ -373,6 +508,7 @@ module.exports = {
   normalizeRetailerSettings,
   parseTargetOutput,
   productMetadata,
+  resolveProductMetadata,
   normalizeTargetUrl,
   targetWorkerMode,
   validateTargetEnvironment,
