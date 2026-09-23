@@ -129,6 +129,7 @@ async function ensureChromeCdp({
   startupTimeoutMs = defaultStartupTimeoutMs,
   pollIntervalMs = defaultPollIntervalMs,
 } = {}) {
+  // Reuse an existing endpoint even if it belongs to a different profile.
   if (await requestVersion(endpoint)) {
     return { available: true, started: false };
   }
@@ -172,6 +173,7 @@ async function ensureChromeCdp({
   await mkdir(userDataDir, { recursive: true });
   state.launchAttempted = true;
   try {
+    // Launch a separate persistent profile; never close unrelated Chrome.
     const child = spawnImpl(executable, args, {
       detached: true,
       stdio: "ignore",

@@ -63,6 +63,7 @@ function createAmazonRunLogger({
     throw new Error("Amazon run logging requires a workflow name.");
   }
 
+  // A skill launch shares one log path across PowerShell and Node events.
   const resolvedPath = path.resolve(logPath || defaultLogPath(workflow));
   fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
   fs.closeSync(fs.openSync(resolvedPath, "a"));
@@ -123,6 +124,7 @@ function installAmazonRunLogger(options) {
     ["error", "error"],
   ]) {
     console[method] = (...args) => {
+      // Sanitize the console too, not just the persistent JSONL record.
       const message = sanitizeAmazonLogText(util.format(...args));
       originals[method](message);
       logger.write(level, [message]);

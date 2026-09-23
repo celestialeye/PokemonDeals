@@ -1,3 +1,4 @@
+// Checkout-only retry worker; /amazon-buy uses amazon-preorder.js for offer and price guards.
 const { chromium } = require("playwright-core");
 const {
   installAmazonRunLogger,
@@ -143,6 +144,7 @@ async function main() {
         await page.waitForTimeout(1000);
 
         const bodyText = await page.locator("body").innerText().catch(() => "");
+        // Leave sign-in and verification pages untouched so the user can finish.
         const verificationVisible = isAmazonVerificationRequired(
           page.url(),
           bodyText,
@@ -184,6 +186,7 @@ async function main() {
         }
 
         if (submissionAttempted) {
+          // A click is not confirmation; never submit twice while awaiting proof.
           if (
             Date.now() - submissionAttemptedAt >=
             postSubmitConfirmationTimeoutMs
@@ -246,6 +249,7 @@ async function main() {
         }).catch(() => {});
       }
     } catch (error) {
+      // Reconnect to inspect the result; submissionAttempted remains latched.
       console.error(`AMAZON_RECONNECT ${sanitizeAmazonError(error)}`);
       await new Promise((resolve) => setTimeout(resolve, 250));
     }

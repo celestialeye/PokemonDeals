@@ -38,6 +38,7 @@ const productUrl =
   (parsedCheckout
     ? `https://www.amazon.com/dp/${parsedCheckout.asin}`
     : null);
+// A supplied checkout URL is a token hint, never the first page we navigate to.
 const suppliedCheckoutUrl = parsedCheckout?.url || null;
 const suppliedOfferListingId = parsedCheckout?.offerListingId || null;
 const inputUrl = parsedProduct?.url || parsedCheckout?.url;
@@ -113,6 +114,8 @@ function selectExpectedCheckoutLineItem(
     expectedTitle: requiredTitle = "",
   } = {},
 ) {
+  // Multiple selectors can find one DOM item; dedupe by its path, then reject
+  // a second item even when it cannot be parsed as the expected product.
   const lineItems = new Map();
   for (const [index, candidate] of candidates.entries()) {
     const text = String(candidate.text || "").replace(/\s+/g, " ").trim();
@@ -349,6 +352,7 @@ async function readContainerAsins(container) {
 async function readElementText(container) {
   return container
     .evaluate((element) => {
+      // Hidden text cannot establish checkout identity; keep rendered text only.
       const parts = [];
       const nodeFilter = element.ownerDocument.defaultView.NodeFilter;
       const walker = element.ownerDocument.createTreeWalker(
@@ -404,6 +408,7 @@ async function collectCheckoutLineItemCandidates(identityNodes) {
     index < Math.min(await identityNodes.count(), 50);
     index += 1
   ) {
+    // Walk up to the smallest visible item containing quantity and price.
     let container = identityNodes.nth(index);
     let fallbackCandidate = null;
     for (let depth = 0; depth < 8; depth += 1) {
@@ -541,6 +546,7 @@ async function findAmazonBuyingOption(page) {
       continue;
     }
 
+    // This control proves the offer is actionable; do not click or use the cart.
     const addToCart = offer.locator(offerAddToCartSelector).first();
     const offerAsin = (
       (await readFirstInputValue(offer, offerAsinSelector)) || ""
@@ -652,6 +658,7 @@ async function main() {
           .catch(() => {});
         await page.waitForTimeout(1000);
 
+        // Manual verification and sign-in take priority over every retry.
         const bodyText = await readBody(page);
         const verificationVisible = isAmazonVerificationRequired(
           page.url(),
@@ -693,6 +700,8 @@ async function main() {
           process.exit(0);
         }
 
+        // Only an explicit duplicate warning after a guarded submission may
+        // permit one more click, on the same page and with the guards latched.
         if (
           submissionAttempted &&
           submissionPage === page &&
@@ -727,6 +736,7 @@ async function main() {
         }
 
         if (submissionAttempted) {
+          // Never re-enter the normal Place order path after a click attempt.
           if (
             Date.now() - submissionAttemptedAt >=
             postSubmitConfirmationTimeoutMs
@@ -762,6 +772,7 @@ async function main() {
           }
 
           if (checkoutRefreshes % offerRecheckInterval === 0) {
+            // A stale token must be revoked if no qualifying offer remains.
             await page
               .goto(productUrl, {
                 waitUntil: "domcontentloaded",
@@ -814,6 +825,8 @@ async function main() {
           .getByRole("button", { name: /place (?:your )?order/i })
           .first();
         if (await isReady(placeOrder)) {
+          // Read the current checkout line item, not a recommendation or
+          // a price seen earlier on the product page.
           const checkoutValidation = validateAmazonCheckoutEvidence({
             currentCheckoutPageVerified: onCheckoutPage,
             directCheckoutIdentityVerified:
@@ -863,6 +876,7 @@ async function main() {
           );
 
           console.log(`AMAZON_PLACE_ORDER_FOUND after ${attempts} attempts`);
+          // Latch before clicking: redirects and click errors must not retry.
           submissionAttempted = true;
           submissionAttemptedAt = Date.now();
           submissionGuardsValidated = true;
@@ -891,12 +905,15 @@ async function main() {
         }
 
         if (onCheckoutPage) {
+          // Leave unfamiliar checkout states untouched rather than clicking
+          // or navigating away before Amazon finishes rendering them.
           await page.waitForTimeout(500);
           continue;
         }
 
         const directOffer = await findAmazonDirectBuyOffer(page);
         if (directOffer) {
+          // Always build from the live offer, even if the input was a Buy Now link.
           attempts += 1;
           activeOfferAsin = directOffer.asin;
           activeOfferListingId = directOffer.offerListingId;
@@ -949,6 +966,8 @@ async function main() {
       }
     } catch (error) {
       if (submissionAttempted) {
+        // Browser loss after a click leaves the outcome unknown; never reconnect
+        // to submit again.
         console.error(
           `AMAZON_ORDER_CONFIRMATION_AMBIGUOUS ${sanitizeAmazonError(error)}`,
         );
