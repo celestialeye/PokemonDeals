@@ -31,11 +31,18 @@ const { inspectChallenge } = require("./target-challenge-page");
 const {
   cartResponseEvent,
   cartResponseKind,
+  checkoutUrl,
+  findProductFulfillmentControl,
   observeCartHandshake,
+  parseRetryAfterMs,
+  purchaseEvidenceFromCartView,
   readPurchaseGuardConfig,
   runTargetCheckout,
+  hasPageSignIn,
+  validatePurchaseEvidence,
   validatePdpIdentity,
 } = require("./target-checkout");
+const { clearTargetContextSession } = require("./src/target-session-reset");
 
 /**
  * @typedef {object} MonitorJob State belonging to one configured product/tab.
@@ -52,8 +59,14 @@ const {
  * @property {boolean} addedToCart Confirmed cart evidence for cart-based checkout.
  * @property {string|null} purchaseMode Active transaction path after purchase input.
  * @property {boolean} completed Explicit order confirmation was observed.
- * @property {"preorder"|"add-to-cart"|"buy-now"|"auto"} requestedMode
+ * @property {"preorder"|"add-to-cart"|"buy-now"|"auto"|"direct-buy"} requestedMode
  * @property {boolean} pendingCartReconciliation Cart input was sent without a final result.
+ * @property {boolean} redirectedCartCheckout The PDP redirected to /cart, so
+ *   that same tab now owns checkout without inspecting the cart page.
+ * @property {boolean} needsRearm A distinct order was confirmed; discard its
+ *   checkout state and reload the PDP before another purchase attempt.
+ * @property {boolean} submittedThisAttempt A new Place-order click completed
+ *   in this transaction; an old confirmation page cannot count as a new order.
  */
 
 // Reuse the existing Chrome context on CDP. The worker creates product tabs, not
@@ -70,9 +83,12 @@ if (!new Set(["patchright", "playwright"]).has(browserDriverName)) {
 const { chromium } = require(
   browserDriverName === "patchright" ? "patchright" : "playwright-core",
 );
-const maximumJobs = 3;
+const multiDirectBuyEnabled = /^(?:1|true|yes)$/i.test(
+  process.env.TARGET_MULTI_DIRECT_BUY || "",
+);
+const maximumJobs = multiDirectBuyEnabled ? 8 : 3;
 const requestedMaximumJobs = Number.parseInt(
-  process.env.TARGET_MAX_CONCURRENT || "3",
+  process.env.TARGET_MAX_CONCURRENT || String(maximumJobs),
   10,
 );
 const concurrentJobLimit = Math.max(
@@ -80,7 +96,7 @@ const concurrentJobLimit = Math.max(
   Math.min(maximumJobs, requestedMaximumJobs || maximumJobs),
 );
 const globalPollDelayMs = Math.max(
-  1500,
+  1000,
   Number.parseInt(process.env.TARGET_MONITOR_POLL_MS || "5000", 10) || 5000,
 );
 const observeOnly = /^(?:1|true|yes)$/i.test(
@@ -137,6 +153,15 @@ const challengeSettleMs = Math.max(
 const stopBeforeSubmit = /^(?:1|true|yes)$/i.test(
   process.env.TARGET_STOP_BEFORE_SUBMIT || "",
 );
+const discordAlertsEnabled = !/^(?:1|true|yes)$/i.test(
+  process.env.TARGET_DISABLE_DISCORD_ALERTS || "",
+);
+const refreshChallengeAfterCycle = /^(?:1|true|yes)$/i.test(
+  process.env.TARGET_CHALLENGE_REFRESH_AFTER_CYCLE || "",
+);
+const resetSessionOnStuck = /^(?:1|true|yes)$/i.test(
+  process.env.TARGET_SESSION_RESET_ON_STUCK || "",
+);
 
 function wait(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -164,6 +189,7 @@ async function waitForPausedPages(
       await waitFor(monitorState.remainingPauseMs());
       return false;
     }
+
     const pausedProductIds = monitorState.challengePauseProductIds();
     for (const job of jobs) {
       if (job.completed || job.terminal) {
@@ -175,13 +201,29 @@ async function waitForPausedPages(
       ) {
         continue;
       }
+      // A matched cart makes the checkout tab the challenge owner. A readable
+      // product tab must not clear a verification pause on checkout.
+      const challengePage = job.addedToCart && job.checkoutPage
+        ? job.checkoutPage
+        : job.preflightChallengePending && job.preflightPage
+          ? job.preflightPage
+          : job.page;
       let detection;
       try {
-        detection = await inspect(job.page);
+        detection = await inspect(challengePage);
       } catch (error) {
         detection = null;
       }
-      if (detection && !detection.detected && !detection.unreadable) {
+      if (
+        detection &&
+        !detection.detected &&
+        !detection.unreadable &&
+        await waitForStableChallengeClear(challengePage, {
+          inspect,
+          waitFor,
+          settleMs: intervalMs,
+        })
+      ) {
         invalidateAvailabilityRequest(job);
         if (!monitorState.releaseChallengeProduct(job.product.id)) {
           continue;
@@ -195,6 +237,60 @@ async function waitForPausedPages(
   return false;
 }
 
+async function waitForStableChallengeClear(
+  page,
+  {
+    inspect = inspectChallenge,
+    waitFor = wait,
+    settleMs = challengeSettleMs,
+    requiredReads = 2,
+  } = {},
+) {
+  for (let read = 0; read < requiredReads; read += 1) {
+    const detection = await inspect(page);
+    if (detection.detected || detection.unreadable) {
+      return false;
+    }
+    if (read + 1 < requiredReads) {
+      await waitFor(settleMs);
+    }
+  }
+  return true;
+}
+
+async function waitForTargetSignIn(
+  page,
+  productId,
+  {
+    inspect = hasPageSignIn,
+    waitFor = wait,
+    intervalMs = 1000,
+    log = console.log,
+  } = {},
+) {
+  let waiting = false;
+  while (!page.isClosed()) {
+    let required;
+    try {
+      required = await inspect(page);
+    } catch (error) {
+      required = true;
+    }
+    if (!required) {
+      if (waiting) {
+        log(`TARGET_SIGN_IN_CLEARED product=${productId} - resuming`);
+      }
+      return "resolved";
+    }
+    if (!waiting) {
+      log(`TARGET_SIGN_IN_REQUIRED product=${productId} - waiting for manual completion`);
+      waiting = true;
+    }
+    await waitFor(intervalMs);
+  }
+  return "blocked";
+}
+
 function parseJobArgument(value) {
   const input = String(value || "").trim();
   if (/^https:\/\//i.test(input)) {
@@ -203,7 +299,7 @@ function parseJobArgument(value) {
   const separator = input.indexOf("=");
   if (separator <= 0) {
     throw new Error(
-      "Each Target job must use preorder=url, add-to-cart=url, or buy-now=url.",
+      "Each Target job must use preorder=url, add-to-cart=url, buy-now=url, or direct-buy=url.",
     );
   }
   const requestedMode = normalizeRequestedPurchaseMode(
@@ -266,7 +362,10 @@ async function resolveProductArgs(args) {
   return resolved;
 }
 
-function parseProducts(args) {
+function parseProducts(args, {
+  jobLimit = concurrentJobLimit,
+  requireDirectBuy = multiDirectBuyEnabled,
+} = {}) {
   const configuredJobs = args.map((value) =>
     typeof value === "string" ? parseJobArgument(value) : value,
   );
@@ -275,10 +374,16 @@ function parseProducts(args) {
       "Pass one to three Target mode=url jobs after the command.",
     );
   }
-  if (configuredJobs.length > concurrentJobLimit) {
+  if (configuredJobs.length > jobLimit) {
     throw new Error(
-      `Received ${configuredJobs.length} products; the configured maximum is ${concurrentJobLimit}.`,
+      `Received ${configuredJobs.length} products; the configured maximum is ${jobLimit}.`,
     );
+  }
+  if (
+    requireDirectBuy &&
+    configuredJobs.some((job) => job.requestedMode !== "direct-buy")
+  ) {
+    throw new Error("Target watchlist mode requires direct-buy for every product.");
   }
   const jobs = configuredJobs.map(({ requestedMode, url }) => ({
     requestedMode,
@@ -300,6 +405,45 @@ function parseProducts(args) {
     unique.set(job.product.id, job);
   }
   return [...unique.values()];
+}
+
+async function acquireProductPage(
+  context,
+  product,
+  {
+    inspect = inspectChallenge,
+    reuseClearProductPage = false,
+  } = {},
+) {
+  const matchingPages = context
+    .pages()
+    .filter((page) => targetProductFromUrl(page.url())?.id === product.id);
+  let detectedPage = null;
+  for (const page of matchingPages) {
+    const detection = await inspect(page).catch(() => null);
+    if (detection?.kind === "press_and_hold") {
+      return page;
+    }
+    if (detection?.detected && !detectedPage) {
+      detectedPage = page;
+    }
+  }
+  // A restarted watchlist owns the same set of product URLs. Reuse a clear
+  // matching tab instead of accumulating one more tab for every product.
+  // A single-product direct buy keeps its existing user-tab isolation policy.
+  return detectedPage ||
+    (reuseClearProductPage ? matchingPages[0] : null) ||
+    context.newPage();
+}
+
+async function closeNewProductPages(jobs, initiallyOpenPages) {
+  // A reused tab belongs to the existing browser session. Close only product
+  // tabs this worker created; restart and shutdown must preserve older tabs.
+  await Promise.all(
+    jobs
+      .filter((job) => !initiallyOpenPages.has(job.page))
+      .map((job) => job.page.close().catch(() => {})),
+  );
 }
 
 function runDiscordHelper(payload) {
@@ -335,6 +479,9 @@ function runDiscordHelper(payload) {
 }
 
 async function sendDiscordAlert(content) {
+  if (!discordAlertsEnabled) {
+    return;
+  }
   try {
     await runDiscordHelper({
       username: "Target availability monitor",
@@ -414,8 +561,11 @@ async function handleChallenge(job, monitorState, reason, {
   maxAttempts = challengeSolveAttempts,
   settleMs = challengeSettleMs,
   waitFor = wait,
+  refreshAfterCycle = refreshChallengeAfterCycle,
+  inspect = inspectChallenge,
+  resetSession = resetSessionOnStuck,
 } = {}) {
-  const detection = await inspectChallenge(job.page);
+  const detection = await inspect(job.page);
   if (!detection.detected) {
     if (!assumeDetected) {
       return "clear";
@@ -429,6 +579,8 @@ async function handleChallenge(job, monitorState, reason, {
   }
 
   if (detection.unreadable) {
+    // A readable Press & Hold control on another tab is not evidence that
+    // this page supports solver input. Fail closed on this page's own state.
     invalidateAvailabilityRequest(job);
     monitorState.pauseForChallenge(
       `${reason} (unreadable page state)`,
@@ -459,7 +611,12 @@ async function handleChallenge(job, monitorState, reason, {
     settleMs,
     wait: waitFor,
     log: (message) => console.log(message),
-    verifyCleared: async () => !(await inspectChallenge(job.page)).detected,
+    verifyCleared: async () =>
+      waitForStableChallengeClear(job.page, {
+        inspect,
+        waitFor: waitFor,
+        settleMs,
+      }),
   });
   // Post-click handling already owns this queue. Re-enqueueing and awaiting
   // itself would deadlock; external challenge entry points still serialize.
@@ -478,7 +635,81 @@ async function handleChallenge(job, monitorState, reason, {
       result.attempts,
       job.product.id,
     );
+    job.challengeCycles = 0;
     return "resolved";
+  }
+
+  if (refreshAfterCycle && detection.kind === "press_and_hold") {
+    const refresh = async () => {
+      console.log(
+        `TARGET_CHALLENGE_REFRESH_AFTER_ATTEMPTS product=${job.product.id}`,
+      );
+      try {
+        await job.page.reload({
+          waitUntil: "domcontentloaded",
+          timeout: 15000,
+        });
+        await job.page.waitForTimeout(750);
+      } catch (refreshError) {
+        console.error(
+          `TARGET_CHALLENGE_REFRESH_FAILED product=${job.product.id}`,
+        );
+        return false;
+      }
+      if (await waitForStableChallengeClear(job.page, {
+        inspect,
+        waitFor,
+        settleMs,
+      })) {
+        invalidateAvailabilityRequest(job);
+        monitorState.clearChallengeBackoff(true);
+        console.log(
+          `TARGET_CHALLENGE_REFRESH_CLEARED product=${job.product.id}`,
+        );
+        return true;
+      }
+      return false;
+    };
+    const refreshed = await (
+      mutationOwned ? refresh() : monitorState.enqueueMutation(refresh)
+    );
+    if (refreshed) {
+      job.challengeCycles = 0;
+      return "resolved";
+    }
+  }
+
+  job.challengeCycles = (job.challengeCycles || 0) + 1;
+  if (resetSession && job.challengeCycles >= 2 && job.context) {
+    const reset = async () => {
+      console.error(
+        `TARGET_SESSION_RESET_STARTED product=${job.product.id}`,
+      );
+      try {
+        const result = await clearTargetContextSession(job.context);
+        invalidateAvailabilityRequest(job);
+        job.challengeCycles = 0;
+        console.log(
+          `TARGET_SESSION_RESET_COMPLETED product=${job.product.id} clearedCookies=${result.clearedCookies}`,
+        );
+        return true;
+      } catch (resetError) {
+        console.error(
+          `TARGET_SESSION_RESET_FAILED product=${job.product.id}`,
+        );
+        return false;
+      }
+    };
+    const resetResult = await (
+      mutationOwned ? reset() : monitorState.enqueueMutation(reset)
+    );
+    if (resetResult) {
+      monitorState.clearChallengeBackoff(true);
+      await job.page
+        .reload({ waitUntil: "domcontentloaded", timeout: 15000 })
+        .catch(() => {});
+      return "resolved";
+    }
   }
 
   invalidateAvailabilityRequest(job);
@@ -507,6 +738,50 @@ async function findPurchaseButton(page, requestedMode) {
     }
   }
   return selectPurchaseCandidate(candidates, requestedMode);
+}
+
+async function selectProductFulfillment(
+  job,
+  {
+    findControl = findProductFulfillmentControl,
+    waitFor = wait,
+    log = console.log,
+  } = {},
+) {
+  const expectedFulfillment = job.purchaseGuardConfig?.expectedFulfillment;
+  if (!expectedFulfillment) {
+    return "not-configured";
+  }
+  const fulfillment = await findControl(job.page, expectedFulfillment);
+  if (fulfillment?.selected) {
+    return "selected";
+  }
+  if (fulfillment?.ambiguous || !fulfillment?.control) {
+    log(
+      `TARGET_FULFILLMENT_CONTROL_NOT_FOUND product=${job.product.id} expected=${expectedFulfillment}`,
+    );
+    return "blocked";
+  }
+  try {
+    await fulfillment.control.click({ timeout: 5000 });
+  } catch (error) {
+    log(
+      `TARGET_FULFILLMENT_CONTROL_FAILED product=${job.product.id} expected=${expectedFulfillment}`,
+    );
+    return "blocked";
+  }
+  await waitFor(500);
+  const confirmed = await findControl(job.page, expectedFulfillment);
+  if (!confirmed?.selected || confirmed.ambiguous) {
+    log(
+      `TARGET_FULFILLMENT_SELECTION_UNCONFIRMED product=${job.product.id} expected=${expectedFulfillment}`,
+    );
+    return "blocked";
+  }
+  log(
+    `TARGET_FULFILLMENT_SELECTED ${expectedFulfillment} product=${job.product.id} source=product`,
+  );
+  return "selected";
 }
 
 async function closeNotAddedDialog(page) {
@@ -637,12 +912,20 @@ async function attachResponseMonitor(job, monitorState) {
 }
 
 /** Load the product page, handle verification first, then inspect purchase controls. */
-async function navigateProduct(job, monitorState) {
+async function navigateProduct(job, monitorState, {
+  waitForAction = false,
+} = {}) {
   await job.page.goto(job.product.url, {
     waitUntil: "domcontentloaded",
     timeout: 20000,
   });
   await job.page.waitForTimeout(750);
+
+  if (
+    (await waitForTargetSignIn(job.page, job.product.id)) === "blocked"
+  ) {
+    return false;
+  }
 
   if (
     (await handleChallenge(
@@ -651,10 +934,14 @@ async function navigateProduct(job, monitorState) {
       `page verification for ${job.product.id}`,
     )) === "blocked"
   ) {
-    return;
+    return false;
   }
 
-  await inspectAndTrigger(job, monitorState, "product page", job.lastSummary);
+  if (waitForAction) {
+    return waitForHydratedPurchaseAction(job, monitorState);
+  } else {
+    return inspectAndTrigger(job, monitorState, "product page", job.lastSummary);
+  }
 }
 
 /** Continue the single winning transaction until confirmation or shared backoff. */
@@ -668,11 +955,33 @@ async function continueCheckout(job, monitorState, {
     return;
   }
   const buyNow = job.purchaseMode === "buy-now";
+  if (!buyNow && monitorState.isCartRateLimited()) {
+    return "retry";
+  }
+  if (!buyNow && !job.checkoutPage) {
+    if (!job.context || typeof job.context.newPage !== "function") {
+      throw new Error("Dedicated Target checkout page is unavailable.");
+    }
+    // Transfer this product's empty-cart preflight tab into checkout.
+    job.checkoutPage = job.preflightPage || await job.context.newPage();
+    job.preflightPage = null;
+    job.checkoutPages?.add(job.checkoutPage);
+    if (job.requestedMode === "direct-buy") {
+      job.stopCartViewMonitor = attachCheckoutCartView(job, job.checkoutPage);
+    }
+    if (job.monitorState) {
+      job.stopCheckoutCartMonitor = attachCartResponseMonitor(
+        job.checkoutPage,
+        job.monitorState,
+        "checkout",
+      );
+    }
+  }
   const checkoutPage = buyNow ? job.page : job.checkoutPage;
   if (!checkoutPage) {
     throw new Error("Dedicated Target checkout page is unavailable.");
   }
-  if (!buyNow && checkoutPage === job.page) {
+  if (!buyNow && checkoutPage === job.page && !job.redirectedCartCheckout) {
     throw new Error("Cart-based Target checkout must use a distinct checkout page.");
   }
 
@@ -685,6 +994,19 @@ async function continueCheckout(job, monitorState, {
       buyNow,
       stopBeforeSubmit,
       shouldPause: () => monitorState.isPaused(),
+      // Checkout can collapse item details in the DOM. Re-fetch the page-owned
+      // cart view at submission time; a cached preflight snapshot is not proof
+      // that the same item, quantity, price, and fulfillment remain selected.
+      evidenceReader: job.requestedMode === "direct-buy" && !buyNow
+        ? async (page) => {
+          if (new URL(page.url()).pathname !== "/checkout" || !job.cartViewUrl) {
+            throw new Error("CHECKOUT_CART_VIEW_UNAVAILABLE");
+          }
+          return purchaseEvidenceFromCartView(
+            await readCheckoutCartView(page, job.cartViewUrl),
+          );
+        }
+        : undefined,
       handleVerification: async (page) => {
         const checkoutJob = { ...job, page };
         return handleChallenge(
@@ -694,8 +1016,31 @@ async function continueCheckout(job, monitorState, {
           { ...challengeOptions, mutationOwned: true },
         );
       },
+      handleSignIn: async (page) =>
+        waitForTargetSignIn(page, job.product.id),
+      log: (message) => {
+        if (message === "PLACE_ORDER_CLICKED") {
+          job.submittedThisAttempt = true;
+        }
+        console.log(message);
+      },
     });
   } catch (checkoutError) {
+    if (checkoutError.code === "CHECKOUT_CART_VIEW_RATE_LIMITED") {
+      if (job.submittedThisAttempt) {
+        job.terminal = true;
+        monitorState.stopForSafety("ambiguous-place-order-outcome", {
+          productId: job.product.id,
+          requestedMode: job.requestedMode,
+        });
+        return "ambiguous";
+      }
+      monitorState.pauseForRateLimit(
+        `checkout cart-view 429 for ${job.product.id}`,
+        checkoutError.retryAfterMs,
+      );
+      return "retry";
+    }
     error(`${job.product.id} CHECKOUT_RUNNER_FAILED ${checkoutError.message}`);
     job.terminal = true;
     monitorState.stopForSafety("checkout-runner-failed", {
@@ -731,7 +1076,16 @@ async function continueCheckout(job, monitorState, {
     return result;
   }
 
-  job.completed = true;
+  if (monitorState.repeatOrdersEnabled() && !job.submittedThisAttempt) {
+    job.terminal = true;
+    monitorState.stopForSafety("confirmation-without-new-submission", {
+      productId: job.product.id,
+    });
+    return "blocked";
+  }
+  const repeatOrder = monitorState.repeatOrdersEnabled();
+  job.completed = !repeatOrder;
+  job.needsRearm = repeatOrder;
   monitorState.markOrderConfirmed(job.product.id, job.purchaseMode);
   await notify(
     `✅ **Target order confirmed** via ${job.purchaseMode}\n${job.product.id}\n${job.product.url}`,
@@ -739,28 +1093,297 @@ async function continueCheckout(job, monitorState, {
   return "confirmed";
 }
 
+/**
+ * Re-fetch the checkout API URL observed from this page. Its query may carry
+ * a transient key, so keep it in memory and return only purchase-guard fields.
+ * A fetch/browser error is reduced to a category before it reaches the log.
+ */
+async function readCheckoutCartView(page, endpointUrl) {
+  try {
+    // Target can navigate between /checkout and /cart during a page.evaluate
+    // fetch, destroying that execution context. The browser context's request
+    // client shares its cookies but survives page navigation. Keep the
+    // transient endpoint URL and full response only in memory.
+    const response = await page.context().request.get(endpointUrl, {
+      timeout: 5000,
+    });
+    if (response.status?.() === 429) {
+      const error = new Error("CHECKOUT_CART_VIEW_RATE_LIMITED");
+      error.code = "CHECKOUT_CART_VIEW_RATE_LIMITED";
+      error.retryAfterMs = parseRetryAfterMs(
+        response.headers?.()["retry-after"],
+      );
+      throw error;
+    }
+    if (!response.ok()) {
+      throw new Error("CHECKOUT_CART_VIEW_UNAVAILABLE");
+    }
+    const view = await response.json();
+    return {
+      // Target omits cart_items entirely for an empty cart. A zero summary
+      // quantity is required before normalizing that omission to an empty
+      // list; a positive or missing quantity remains ambiguous.
+      cart_items: Array.isArray(view.cart_items)
+        ? view.cart_items.map((item) => ({
+          tcin: item.tcin,
+          quantity: item.quantity,
+          total_cart_item_quantity: item.total_cart_item_quantity,
+          current_price: item.current_price,
+          fulfillment: { type: item.fulfillment?.type },
+        }))
+        : Number(view.summary?.items_quantity) === 0
+          ? []
+          : null,
+      summary: {
+        items_quantity: view.summary?.items_quantity,
+        grand_total: view.summary?.grand_total,
+      },
+    };
+  } catch (error) {
+    if (error.code === "CHECKOUT_CART_VIEW_RATE_LIMITED") {
+      throw error;
+    }
+    throw new Error("CHECKOUT_CART_VIEW_UNAVAILABLE");
+  }
+}
+
+/** Retain the current successful checkout cart-view URL without logging it. */
+function attachCheckoutCartView(job, page) {
+  const onResponse = (response) => {
+    try {
+      const url = new URL(response.url());
+      if (
+        url.hostname === "carts.target.com" &&
+        url.pathname === "/web_checkouts/v1/cart_views" &&
+        response.status() === 200
+      ) {
+        job.cartViewUrl = response.url();
+      }
+    } catch (error) {
+      // An unrelated response cannot establish cart identity.
+    }
+  };
+  page.on("response", onResponse);
+  return () => page.off("response", onResponse);
+}
+
+/**
+ * Checkout-only existing-item preflight. Never navigate to or inspect /cart:
+ * Target can redirect there between awaited operations, so re-check the URL
+ * after page inspection and the cart-view fetch before claiming the purchase.
+ * Redirects back to /checkout have no count cap by operator instruction.
+ */
+async function inspectDirectBuyCheckout(job, monitorState, {
+  openPage = () => job.preflightPage && !job.preflightPage.isClosed?.()
+    ? job.preflightPage
+    : job.context.newPage(),
+  inspectPage = inspectChallenge,
+  readCartView = readCheckoutCartView,
+  allowOccupiedCart = false,
+  retainPage = job.requestedMode === "direct-buy",
+  mutationOwned = false,
+  log = console.log,
+} = {}) {
+  if (monitorState.isCartRateLimited()) {
+    return "retry";
+  }
+  const page = await openPage();
+  if (page !== job.page) {
+    job.checkoutPages?.add(page);
+  }
+  const stopCartViewMonitor = attachCheckoutCartView(job, page);
+  const stop = (reason) => {
+    if (job.preflightPage === page) {
+      job.preflightPage = null;
+    }
+    job.terminal = true;
+    monitorState.stopForSafety(reason, { productId: job.product.id });
+    return "blocked";
+  };
+  const retry = () => {
+    if (retainPage && page !== job.page) {
+      job.preflightPage = page;
+    }
+    return "retry";
+  };
+  try {
+    while (true) {
+      job.cartViewUrl = null;
+      await page.goto(checkoutUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: 20000,
+      });
+      const pathname = new URL(page.url()).pathname;
+      if (pathname === "/cart") {
+        log("TARGET_CHECKOUT_CART_REDIRECT");
+        continue;
+      }
+      if (pathname !== "/checkout") {
+        return stop("checkout-preflight-unexpected-page");
+      }
+      const detection = await inspectPage(page);
+      if (new URL(page.url()).pathname === "/cart") {
+        log("TARGET_CHECKOUT_CART_REDIRECT");
+        continue;
+      }
+      if (detection.detected) {
+        const result = await handleChallenge(
+          { ...job, page },
+          monitorState,
+          `checkout preflight verification for ${job.product.id}`,
+          { mutationOwned },
+        );
+        if (result === "resolved") {
+          job.preflightChallengePending = false;
+          continue;
+        }
+        // Recovery remains active in the monitor; a preflight challenge has
+        // not sent a cart or Place-order input and must not end the watch.
+        job.preflightChallengePending = retainPage;
+        if (retainPage && page === job.page) {
+          job.preflightPage = page;
+        }
+        return retry();
+      }
+      job.preflightChallengePending = false;
+      for (let tick = 0; tick < 100 && !job.cartViewUrl; tick += 1) {
+        if (new URL(page.url()).pathname === "/cart") {
+          break;
+        }
+        await wait(100);
+      }
+      if (new URL(page.url()).pathname === "/cart") {
+        log("TARGET_CHECKOUT_CART_REDIRECT");
+        continue;
+      }
+      if (!job.cartViewUrl) {
+        return retry();
+      }
+      let cartView;
+      try {
+        cartView = await readCartView(page, job.cartViewUrl);
+      } catch (error) {
+        if (error.code === "CHECKOUT_CART_VIEW_RATE_LIMITED") {
+          monitorState.pauseForRateLimit(
+            `checkout cart-view 429 for ${job.product.id}`,
+            error.retryAfterMs,
+          );
+        }
+        // A transient read failure says nothing about the cart contents.
+        // Keep the watch alive and recheck from /checkout on the next tick.
+        log(`TARGET_CHECKOUT_CART_VIEW_RETRY product=${job.product.id}`);
+        return retry();
+      }
+      if (new URL(page.url()).pathname === "/cart") {
+        log("TARGET_CHECKOUT_CART_REDIRECT");
+        continue;
+      }
+      if (new URL(page.url()).pathname !== "/checkout") {
+        return stop("checkout-preflight-unexpected-page");
+      }
+      const evidence = purchaseEvidenceFromCartView(cartView);
+      if (
+        Array.isArray(cartView?.cart_items) &&
+        cartView.cart_items.length === 0 &&
+        Number(cartView?.summary?.items_quantity) === 0
+      ) {
+        if (retainPage && page !== job.page) {
+          job.preflightPage = page;
+        }
+        return "empty";
+      }
+      const validation = validatePurchaseEvidence(evidence, {
+        expectedProductId: job.product.id,
+        ...job.purchaseGuardConfig,
+      });
+      if (
+        allowOccupiedCart &&
+        evidence.items.length > 0 &&
+        (
+          evidence.items.length !== 1 ||
+          evidence.items[0].productId !== job.product.id ||
+          evidence.items[0].quantity !== 1
+        )
+      ) {
+        if (job.preflightPage === page) {
+          job.preflightPage = null;
+        }
+        return "occupied";
+      }
+      // Only explicit zero-item evidence permits a new product action.
+      // Unknown or mismatched checkout data cannot be treated as empty.
+      if (!validation.ok || !monitorState.claimPurchase(job.product.id)) {
+        return stop("checkout-preflight-mismatch-or-unreadable");
+      }
+      job.checkoutPage = page;
+      job.preflightPage = null;
+      job.redirectedCartCheckout ||= page === job.page;
+      job.stopCartViewMonitor = stopCartViewMonitor;
+      job.pendingCartReconciliation = false;
+      job.addedToCart = true;
+      job.purchaseMode ||= "add-to-cart";
+      if (job.monitorState) {
+        job.stopCheckoutCartMonitor = attachCartResponseMonitor(
+          page,
+          job.monitorState,
+          "checkout",
+        );
+      }
+      log(`TARGET_CHECKOUT_PREFLIGHT_MATCH product=${job.product.id} quantity=1`);
+      return "matched";
+    }
+  } finally {
+    if (job.checkoutPage !== page) {
+      stopCartViewMonitor();
+      if (job.preflightPage !== page && page !== job.page) {
+        job.checkoutPages?.delete(page);
+        await page.close();
+      }
+    }
+  }
+}
+
 async function reconcilePendingCart(job, monitorState, {
   notify = sendDiscordAlert,
   challengeOptions = {},
   checkoutRunner = runTargetCheckout,
+  checkoutPreflight = inspectDirectBuyCheckout,
 } = {}) {
   if (job.completed || job.terminal || monitorState.isPaused()) {
     return;
   }
-  const challengeResult = await handleChallenge(
-    job,
-    monitorState,
-    `verification after ${job.purchaseMode} for ${job.product.id}`,
-    { ...challengeOptions, mutationOwned: true },
-  );
-  if (challengeResult === "blocked") {
-    return;
+  const redirectedToCart = new URL(job.page.url()).pathname === "/cart";
+  if (redirectedToCart) {
+    // A cart mutation can redirect after a 429 or uncertain response. Never
+    // inspect the cart challenge. Reuse this tab for /checkout reconciliation.
+    await closePreflightPage(job);
+    job.redirectedCartCheckout = true;
+    await job.page.goto(checkoutUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 20000,
+    }).catch(() => {});
+    if (new URL(job.page.url()).pathname === "/cart") {
+      return "pending";
+    }
+  } else {
+    const challengeResult = await handleChallenge(
+      job,
+      monitorState,
+      `verification after ${job.purchaseMode} for ${job.product.id}`,
+      { ...challengeOptions, mutationOwned: true },
+    );
+    if (challengeResult === "blocked") {
+      return;
+    }
+    if (challengeResult === "resolved") {
+      await job.page.waitForTimeout(1000);
+    }
   }
-  if (challengeResult === "resolved") {
-    await job.page.waitForTimeout(1000);
+  if (monitorState.isCartRateLimited()) {
+    return "pending";
   }
 
-  if (await closeNotAddedDialog(job.page)) {
+  if (!redirectedToCart && await closeNotAddedDialog(job.page)) {
     console.log(`${job.product.id} ITEM_NOT_ADDED_TO_CART`);
     job.pendingCartReconciliation = false;
     job.purchaseMode = null;
@@ -771,8 +1394,36 @@ async function reconcilePendingCart(job, monitorState, {
     return "not-added";
   }
 
-  const body = await job.page.locator("body").innerText().catch(() => "");
-  if (!isCartSuccess(job.page.url(), body)) {
+  const body = redirectedToCart
+    ? ""
+    : await job.page.locator("body").innerText().catch(() => "");
+  if (redirectedToCart || !isCartSuccess(job.page.url(), body)) {
+    if (job.requestedMode === "direct-buy") {
+      // Reconcile uncertain cart input from /checkout; never visit /cart or
+      // replay the product action before validating exact identity there.
+      const status = await checkoutPreflight(job, monitorState, {
+        ...(job.redirectedCartCheckout
+          ? { openPage: async () => job.page }
+          : {}),
+        mutationOwned: true,
+      });
+      if (status === "matched") {
+        return continueCheckout(job, monitorState, {
+          notify,
+          challengeOptions,
+          checkoutRunner,
+        });
+      }
+      if (status === "empty") {
+        // The checkout cart is authoritative: the prior click did not leave
+        // this item there. Retain ownership for one fresh product action.
+        job.pendingCartReconciliation = false;
+        job.purchaseMode = null;
+        job.cartRetryPending = true;
+        return "retry-cart";
+      }
+      return status;
+    }
     console.log(`${job.product.id} PURCHASE_RESULT_UNCONFIRMED`);
     return "pending";
   }
@@ -800,7 +1451,9 @@ async function triggerPurchase(job, monitorState, source, summary, candidate, {
   notify = sendDiscordAlert,
   challengeOptions = {},
   checkoutRunner = runTargetCheckout,
+  checkoutPreflight = inspectDirectBuyCheckout,
   cartHandshake = observeCartHandshake,
+  multiDirectBuy = multiDirectBuyEnabled,
 } = {}) {
   if (
     job.triggered ||
@@ -818,9 +1471,12 @@ async function triggerPurchase(job, monitorState, source, summary, candidate, {
     candidate.mode || purchaseModeFromLabel(candidate.label);
 
   try {
+    const automaticallySelected = ["auto", "direct-buy"].includes(
+      job.requestedMode,
+    );
     if (
       !candidateMode ||
-      (job.requestedMode !== "auto" && candidateMode !== job.requestedMode) ||
+      (!automaticallySelected && candidateMode !== job.requestedMode) ||
       (job.requestedMode === "auto" && candidateMode === "buy-now")
     ) {
       throw new Error("PURCHASE_MODE_MISMATCH");
@@ -828,16 +1484,50 @@ async function triggerPurchase(job, monitorState, source, summary, candidate, {
     if (!validatePdpIdentity(job.page.url(), job.product.id)) {
       throw new Error("PDP_IDENTITY_VALIDATION_FAILED");
     }
+    if (candidateMode !== "buy-now" && monitorState.isCartRateLimited()) {
+      return;
+    }
     if (!monitorState.claimPurchase(job.product.id, job.requestedMode)) {
       return;
     }
     ownerClaimed = true;
+    if (multiDirectBuy && candidateMode !== "buy-now") {
+      if (monitorState.cartFallbackBlocked()) {
+        monitorState.releasePurchase(job.product.id);
+        ownerClaimed = false;
+        return;
+      }
+      const cartStatus = await checkoutPreflight(job, monitorState, {
+        allowOccupiedCart: true,
+        retainPage: multiDirectBuy,
+        mutationOwned: true,
+      });
+      if (cartStatus === "occupied") {
+        monitorState.blockCartFallback();
+        monitorState.releasePurchase(job.product.id);
+        ownerClaimed = false;
+        return;
+      }
+      if (cartStatus === "matched") {
+        await continueCheckout(job, monitorState, {
+          notify,
+          challengeOptions,
+          checkoutRunner,
+        });
+        return;
+      }
+      if (cartStatus !== "empty") {
+        if (cartStatus === "retry" && !job.cartRetryPending) {
+          monitorState.releasePurchase(job.product.id);
+        }
+        return;
+      }
+    }
     alertPromise = notify(
       availabilityMessage(job, source, candidate.label, summary),
     );
-    await candidate.button.hover({ timeout: 3000 }).catch(() => {});
-    await job.page.waitForTimeout(150 + Math.floor(Math.random() * 251));
     inputMayHaveBeenSent = true;
+    job.cartRetryPending = false;
     if (candidateMode === "buy-now") {
       job.purchaseMode = "buy-now";
     } else {
@@ -847,7 +1537,6 @@ async function triggerPurchase(job, monitorState, source, summary, candidate, {
     let handshake = null;
     if (candidateMode === "buy-now") {
       await candidate.button.click({ timeout: 5000 });
-      await job.page.waitForTimeout(5000);
     } else {
       handshake = await cartHandshake(
         job.page,
@@ -876,20 +1565,29 @@ async function triggerPurchase(job, monitorState, source, summary, candidate, {
       }
     }
 
-    const postClick = await handleChallenge(
-      job,
-      monitorState,
-      `verification after ${candidate.label} for ${job.product.id}`,
-      { ...challengeOptions, mutationOwned: true },
-    );
-    if (postClick === "blocked") {
+    if (candidateMode !== "buy-now" &&
+        new URL(job.page.url()).pathname === "/cart") {
+      // Target may redirect after Add to cart. The checkout runner moves this
+      // tab straight to /checkout before reading it, avoiding the cart
+      // verification page and another tab.
+      job.pendingCartReconciliation = false;
+      job.addedToCart = true;
+      await closePreflightPage(job);
+      job.checkoutPage = job.page;
+      job.redirectedCartCheckout = true;
+      job.stopCartViewMonitor = attachCheckoutCartView(job, job.page);
+      console.log(`${job.product.id} PURCHASE_ADDED_TO_CART`);
+      await continueCheckout(job, monitorState, {
+        notify,
+        challengeOptions,
+        checkoutRunner,
+      });
       return;
-    }
-    if (postClick === "resolved") {
-      await job.page.waitForTimeout(1000);
     }
 
     if (candidateMode === "buy-now") {
+      // Checkout already polls for the side panel and handles verification.
+      // A fixed page wait and a second challenge inspection delay that path.
       console.log(`${job.product.id} BUY_NOW_PANEL_OPENED`);
       const outcome = await continueCheckout(job, monitorState, {
         notify,
@@ -909,6 +1607,19 @@ async function triggerPurchase(job, monitorState, source, summary, candidate, {
         }
       }
       return;
+    }
+
+    const postClick = await handleChallenge(
+      job,
+      monitorState,
+      `verification after ${candidate.label} for ${job.product.id}`,
+      { ...challengeOptions, mutationOwned: true },
+    );
+    if (postClick === "blocked") {
+      return;
+    }
+    if (postClick === "resolved") {
+      await job.page.waitForTimeout(1000);
     }
 
     if (await closeNotAddedDialog(job.page)) {
@@ -938,7 +1649,6 @@ async function triggerPurchase(job, monitorState, source, summary, candidate, {
       return;
     }
     console.log(`${job.product.id} PURCHASE_RESULT_UNCONFIRMED`);
-    console.log(`${job.product.id} PURCHASE_RESULT_UNCONFIRMED`);
   } catch (error) {
     console.error(`${job.product.id} PURCHASE_ACTION_FAILED ${error.message}`);
     if (ownerClaimed && candidateMode === "buy-now" && inputMayHaveBeenSent) {
@@ -957,8 +1667,28 @@ async function triggerPurchase(job, monitorState, source, summary, candidate, {
 }
 
 async function inspectAndTrigger(job, monitorState, source, summary) {
+  // Unavailable PDPs have no purchase action and often no Shipping selector.
+  // Inspect fulfillment only when there is an actionable purchase candidate.
+  if (!await findPurchaseButton(job.page, job.requestedMode)) {
+    return false;
+  }
+  const fulfillment = await selectProductFulfillment(job, {
+    log: console.log,
+  });
+  if (fulfillment === "blocked") {
+    return false;
+  }
+  // Choosing Shipping can rerender the action module. Reacquire the button
+  // after that change so the purchase mutation uses a current visible control.
   const candidate = await findPurchaseButton(job.page, job.requestedMode);
   if (!candidate) {
+    return false;
+  }
+  if (
+    multiDirectBuyEnabled &&
+    candidate.mode !== "buy-now" &&
+    monitorState.cartFallbackBlocked()
+  ) {
     return false;
   }
 
@@ -975,12 +1705,112 @@ async function inspectAndTrigger(job, monitorState, source, summary) {
   return true;
 }
 
+/** Inspect the hydrated PDP after a positive API signal before reloading it. */
+async function waitForHydratedPurchaseAction(job, monitorState, {
+  inspect = inspectAndTrigger,
+  waitFor = wait,
+  attempts = 20,
+} = {}) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (await inspect(job, monitorState, "product page", job.lastSummary)) {
+      return true;
+    }
+    if (monitorState?.isPaused?.() || monitorState?.shouldStop?.()) {
+      return false;
+    }
+    if (attempt + 1 < attempts) {
+      await waitFor(250);
+    }
+  }
+  return false;
+}
+
+/** Use an already actionable PDP before paying for another page navigation. */
+async function actOnAvailabilityCandidate(job, monitorState, {
+  inspect = inspectAndTrigger,
+  navigate = navigateProduct,
+} = {}) {
+  if (await inspect(job, monitorState, "product page", job.lastSummary)) {
+    return true;
+  }
+  return Boolean(await navigate(job, monitorState, { waitForAction: true }));
+}
+
+/** Resolve an uncertain cart click before admitting another product. */
+async function retryCartPurchase(job, monitorState, {
+  inspect = inspectAndTrigger,
+  navigate = navigateProduct,
+} = {}) {
+  if (monitorState.isCartRateLimited()) {
+    return "waiting";
+  }
+  let attempted = false;
+  if (validatePdpIdentity(job.page.url(), job.product.id)) {
+    attempted = await inspect(job, monitorState, "cart retry", job.lastSummary);
+  }
+  if (!attempted && !monitorState.isPaused()) {
+    attempted = await navigate(job, monitorState, { waitForAction: true });
+  }
+  if (attempted || monitorState.isPaused()) {
+    return attempted ? "attempted" : "waiting";
+  }
+  // Stock and the visible control are gone. Release the lease so the
+  // watchlist can pursue another product, then revisit this one normally.
+  job.cartRetryPending = false;
+  monitorState.releasePurchase(job.product.id);
+  return "unavailable";
+}
+
+async function closePreflightPage(job) {
+  const page = job.preflightPage;
+  job.preflightPage = null;
+  job.preflightChallengePending = false;
+  if (page && page !== job.page && page !== job.checkoutPage) {
+    job.checkoutPages?.delete(page);
+    await page.close().catch(() => {});
+  }
+}
+
+/** Drop old checkout and response state before another order for this TCIN. */
+async function rearmConfirmedJob(job, monitorState, {
+  navigate = navigateProduct,
+} = {}) {
+  job.stopCheckoutCartMonitor?.();
+  job.stopCartViewMonitor?.();
+  job.stopCheckoutCartMonitor = null;
+  job.stopCartViewMonitor = null;
+  const oldCheckoutPage = job.checkoutPage;
+  job.checkoutPage = null;
+  job.checkoutPages?.delete(oldCheckoutPage);
+  if (oldCheckoutPage && oldCheckoutPage !== job.page) {
+    await oldCheckoutPage.close().catch(() => {});
+  }
+  await closePreflightPage(job);
+  job.addedToCart = false;
+  job.purchaseMode = null;
+  job.pendingCartReconciliation = false;
+  job.cartRetryPending = false;
+  job.redirectedCartCheckout = false;
+  job.cartViewUrl = null;
+  job.submittedThisAttempt = false;
+  job.pollCount = 0;
+  job.needsRearm = false;
+  invalidateAvailabilityRequest(job);
+  await navigate(job, monitorState);
+}
+
 /**
- * One tick, normally invoked through enqueueGlobalPoll. Priority is deferred
- * challenge -> obtain/refresh a template -> replay one request -> inspect stock.
- * evaluate(fetch) deliberately uses this page's cookie jar, not a bare HTTP client.
+ * One tick, normally invoked through enqueueGlobalPoll. An established
+ * transaction goes to checkout before product-page challenge inspection:
+ * after exact-cart preflight the checkout tab, not the PDP, owns the next
+ * action. A new product job then handles deferred challenges, request-template
+ * discovery, one page-owned API fetch, and stock inspection in that order.
  */
-async function pollAvailability(job, monitorState) {
+async function pollAvailability(job, monitorState, {
+  checkoutRunner = continueCheckout,
+  rearmRunner = rearmConfirmedJob,
+  retryRunner = retryCartPurchase,
+} = {}) {
   if (
     job.completed ||
     job.terminal ||
@@ -990,16 +1820,36 @@ async function pollAvailability(job, monitorState) {
     return;
   }
 
-  if (job.pendingCartReconciliation) {
-    await monitorState.enqueueMutation(() =>
-      reconcilePendingCart(job, monitorState),
+  if (job.needsRearm) {
+    await rearmRunner(job, monitorState);
+    return;
+  }
+
+  if (job.preflightChallengePending && job.preflightPage) {
+    if (job.preflightPage.isClosed?.()) {
+      job.checkoutPages?.delete(job.preflightPage);
+      job.preflightPage = null;
+      job.preflightChallengePending = false;
+      return;
+    }
+    const result = await handleChallenge(
+      { ...job, page: job.preflightPage },
+      monitorState,
+      `checkout preflight verification for ${job.product.id}`,
     );
+    if (result !== "blocked") {
+      job.preflightChallengePending = false;
+      if (job.preflightPage === job.page) {
+        job.preflightPage = null;
+      }
+      invalidateAvailabilityRequest(job);
+    }
     return;
   }
 
   if (job.addedToCart || job.purchaseMode === "buy-now") {
     const outcome = await monitorState.enqueueMutation(() =>
-      continueCheckout(job, monitorState),
+      checkoutRunner(job, monitorState),
     );
     if (outcome === "retry" && job.purchaseMode === "buy-now") {
       if (validatePdpIdentity(job.page.url(), job.product.id)) {
@@ -1013,6 +1863,42 @@ async function pollAvailability(job, monitorState) {
         });
       }
     }
+    return;
+  }
+
+  if (job.pendingCartReconciliation &&
+      new URL(job.page.url()).pathname === "/cart") {
+    await monitorState.enqueueMutation(() =>
+      reconcilePendingCart(job, monitorState),
+    );
+    return;
+  }
+  if (job.cartRetryPending &&
+      new URL(job.page.url()).pathname === "/cart") {
+    await retryRunner(job, monitorState);
+    return;
+  }
+
+  const pageChallenge = await handleChallenge(
+    job,
+    monitorState,
+    `page verification during poll for ${job.product.id}`,
+  );
+  if (pageChallenge === "blocked") {
+    return;
+  }
+  if (pageChallenge === "resolved") {
+    return;
+  }
+
+  if (job.pendingCartReconciliation) {
+    await monitorState.enqueueMutation(() =>
+      reconcilePendingCart(job, monitorState),
+    );
+    return;
+  }
+  if (job.cartRetryPending) {
+    await retryRunner(job, monitorState);
     return;
   }
 
@@ -1131,7 +2017,7 @@ async function pollAvailability(job, monitorState) {
   }
 
   if (summary?.available) {
-    await navigateProduct(job, monitorState);
+    await actOnAvailabilityCandidate(job, monitorState);
   } else {
     await inspectAndTrigger(job, monitorState, "product page", summary);
   }
@@ -1150,6 +2036,10 @@ async function pollAvailability(job, monitorState) {
  * @param {object} [options]
  * @param {boolean} [options.observe] Disable alerts/enable diagnostic stop rules.
  * @param {boolean} [options.validation] Permit verified API-challenge recovery.
+ * @param {boolean} [options.continueAfterOrder] Keep the explicit multi-product
+ *   watchlist polling after a confirmed order, excluding that product.
+ * @param {boolean} [options.repeatAfterOrder] Rearm confirmed products for
+ *   a fresh quantity-one transaction in the explicit overnight watchlist.
  * @param {number} [options.maximumPolls] Recorded API-poll limit; zero is unlimited.
  * @param {number} [options.runtimeMs] Run limit checked between operations; zero disables.
  * @param {() => number} [options.now] Millisecond clock for pause/runtime decisions.
@@ -1161,6 +2051,9 @@ async function pollAvailability(job, monitorState) {
 function createMonitorState({
   observe = observeOnly,
   validation = validateChallenges,
+  continueAfterOrder = multiDirectBuyEnabled,
+  repeatAfterOrder = multiDirectBuyEnabled &&
+    /^(?:1|true|yes)$/i.test(process.env.TARGET_REPEAT_CONFIRMED_ORDERS || ""),
   maximumPolls = maximumApiPolls,
   runtimeMs = maximumRuntimeMs,
   now = Date.now,
@@ -1172,14 +2065,21 @@ function createMonitorState({
   let pausedUntil = 0;
   let pauseKind = null;
   let pausedProductIds = new Set();
+  let cartRateLimitedUntil = 0;
+  let cartRateLimitAttempt = 0;
   let mutationQueue = Promise.resolve();
   let calibrationStopped = false;
   let challengePending = false;
   let purchaseOwner = null;
+  let cartFallbackBlocked = false;
   let confirmedOrder = null;
+  const confirmedOrders = [];
+  const confirmedProductIds = new Set();
   let terminalStop = null;
   const startedAt = now();
   const apiPolls = [];
+  const lastApiPollByProduct = new Map();
+  let lastApiPoll = null;
   const cartResponses = [];
   const observedCartResponses = new WeakSet();
   const challengeSolves = [];
@@ -1192,7 +2092,8 @@ function createMonitorState({
   const state = {
     canAttemptPurchase(productId) {
       return (
-        !confirmedOrder &&
+        (!confirmedOrder || continueAfterOrder) &&
+        (repeatAfterOrder || !confirmedProductIds.has(productId)) &&
         !terminalStop &&
         (!purchaseOwner || purchaseOwner === productId)
       );
@@ -1207,8 +2108,15 @@ function createMonitorState({
     purchaseOwner() {
       return purchaseOwner;
     },
+    cartFallbackBlocked() {
+      return cartFallbackBlocked;
+    },
+    blockCartFallback() {
+      cartFallbackBlocked = true;
+      log("TARGET_CART_FALLBACK_DISABLED existing-cart-items");
+    },
     releasePurchase(productId) {
-      if (!confirmedOrder && purchaseOwner === productId) {
+      if ((!confirmedOrder || continueAfterOrder) && purchaseOwner === productId) {
         purchaseOwner = null;
       }
     },
@@ -1216,12 +2124,25 @@ function createMonitorState({
       if (purchaseOwner && purchaseOwner !== productId) {
         throw new Error("Order confirmation does not match the purchase owner.");
       }
-      purchaseOwner = productId;
+      if (confirmedProductIds.has(productId) && !repeatAfterOrder) {
+        throw new Error("The watchlist already confirmed this product.");
+      }
+      purchaseOwner = continueAfterOrder ? null : productId;
+      if (continueAfterOrder) {
+        // Another item's fallback gets a fresh cart preflight after this
+        // checkout. A prior occupied-cart observation is no longer current.
+        cartFallbackBlocked = false;
+      }
       confirmedOrder = { productId, mode, at: new Date().toISOString() };
+      confirmedOrders.push(confirmedOrder);
+      confirmedProductIds.add(productId);
       log(`TARGET_ORDER_CONFIRMED ${JSON.stringify(confirmedOrder)}`);
     },
     isOrderConfirmed() {
-      return Boolean(confirmedOrder);
+      return Boolean(confirmedOrder) && !continueAfterOrder;
+    },
+    repeatOrdersEnabled() {
+      return continueAfterOrder && repeatAfterOrder;
     },
     isPaused() {
       return now() < pausedUntil;
@@ -1234,6 +2155,22 @@ function createMonitorState({
     },
     remainingPauseMs() {
       return Math.max(0, pausedUntil - now());
+    },
+    isCartRateLimited() {
+      return now() < cartRateLimitedUntil;
+    },
+    remainingCartRateLimitMs() {
+      return Math.max(0, cartRateLimitedUntil - now());
+    },
+    heartbeatSnapshot() {
+      return {
+        purchaseOwner,
+        challengePaused: state.isChallengePaused(),
+        cartRateLimitMs: state.remainingCartRateLimitMs(),
+        lastApiPollAgeMs: lastApiPoll ? Math.max(0, now() - lastApiPoll.atMs) : null,
+        lastApiProductId: lastApiPoll?.productId || null,
+        confirmedOrders: confirmedOrders.length,
+      };
     },
     remainingRuntimeMs() {
       return runtimeMs > 0 ? Math.max(0, startedAt + runtimeMs - now()) : Infinity;
@@ -1265,23 +2202,24 @@ function createMonitorState({
       }
     },
     pauseForRateLimit(reason, retryAfterMs = 0) {
-      if (now() < pausedUntil) {
-        if (retryAfterMs > state.remainingPauseMs()) {
-          pausedUntil = now() + retryAfterMs;
+      // A cart-service 429 does not establish that availability reads were
+      // throttled. Cool only cart reads/mutations, retaining the transaction
+      // owner until its cart state can be reconciled.
+      if (state.isCartRateLimited()) {
+        if (retryAfterMs > state.remainingCartRateLimitMs()) {
+          cartRateLimitedUntil = now() + retryAfterMs;
           error(`TARGET_RATE_LIMIT_EXTENDED ${retryAfterMs}ms ${reason}`);
         }
         return;
       }
       const backoff = calculateBackoffMs(
-        challengeAttempt,
+        cartRateLimitAttempt,
         cartRateLimitBaseDelayMs,
         challengeMaximumDelayMs,
       );
       const delay = Math.max(backoff, retryAfterMs || 0);
-      challengeAttempt += 1;
-      pausedUntil = now() + delay;
-      pauseKind = "rate-limit";
-      pausedProductIds = new Set();
+      cartRateLimitAttempt += 1;
+      cartRateLimitedUntil = Math.max(cartRateLimitedUntil, now() + delay);
       calibrationStopped ||= observe;
       error(`TARGET_RATE_LIMIT_BACKOFF ${delay}ms ${reason}`);
       if (!observe) {
@@ -1390,10 +2328,28 @@ function createMonitorState({
           `cart ${result.kind} 429${source ? ` on ${source}` : ""}`,
           result.retryAfterMs,
         );
+      } else if (
+        result.kind === "mutation" &&
+        result.status >= 200 &&
+        result.status < 300
+      ) {
+        cartRateLimitAttempt = 0;
+        cartRateLimitedUntil = 0;
       }
     },
     recordApiPoll(result) {
-      apiPolls.push({ at: new Date().toISOString(), ...result });
+      const atMs = now();
+      const previousAt = lastApiPollByProduct.get(result.productId);
+      const event = {
+        at: new Date(atMs).toISOString(),
+        ...result,
+        pollGapMs: previousAt === undefined ? null : Math.max(0, atMs - previousAt),
+      };
+      if (result.productId) {
+        lastApiPollByProduct.set(result.productId, atMs);
+      }
+      lastApiPoll = { atMs, productId: result.productId };
+      apiPolls.push(event);
       if (observe && validation && result.outcome === "challenge") {
         // The current poll must resolve or stop before another request is allowed.
         challengePending = true;
@@ -1446,6 +2402,7 @@ function createMonitorState({
         challengeSolverConfigured: Boolean(challengeSolver),
         purchaseOwner,
         confirmedOrder,
+        confirmedOrders,
         terminalStop,
         fetchErrorCount: apiPolls.filter((poll) => poll.outcome === "fetch_error").length,
         cartResponses: cartResponses.length,
@@ -1474,7 +2431,7 @@ async function main() {
   const purchaseGuardConfig = readPurchaseGuardConfig(process.env, {
     required: false,
   });
-  if (!observeOnly) {
+  if (!observeOnly && discordAlertsEnabled) {
     await verifyDiscordConfiguration();
   }
 
@@ -1487,20 +2444,33 @@ async function main() {
   }
 
   const monitorState = createMonitorState();
+  const heartbeatTimer = setInterval(() => {
+    console.log(
+      `TARGET_MONITOR_HEARTBEAT ${JSON.stringify(monitorState.heartbeatSnapshot())}`,
+    );
+  }, 30000);
+  heartbeatTimer.unref();
   const jobs = [];
-  const checkoutPage = observeOnly ? null : await context.newPage();
-  const stopCheckoutCartMonitor = checkoutPage
-    ? attachCartResponseMonitor(checkoutPage, monitorState, "checkout")
-    : () => {};
+  const checkoutPages = new Set();
+  const initiallyOpenPages = new Set(context.pages());
   try {
     for (const configured of configuredJobs) {
+      if (multiDirectBuyEnabled && monitorState.isPaused()) {
+        // Opening another PDP during a shared challenge/429 pause would
+        // create fresh background traffic before the first tab recovers.
+        console.log(`TARGET_MONITOR_SETUP_PAUSED ${monitorState.remainingPauseMs()}ms`);
+        await waitForPausedPages(jobs, monitorState);
+        monitorState.clearChallengeBackoff();
+      }
       if (monitorState.shouldStop() || monitorState.isOrderConfirmed()) {
         break;
       }
       const job = {
         product: configured.product,
         requestedMode: configured.requestedMode,
-        page: await context.newPage(),
+        page: await acquireProductPage(context, configured.product, {
+          reuseClearProductPage: multiDirectBuyEnabled,
+        }),
         availabilityRequest: null,
         lastSummary: null,
         lastFingerprint: null,
@@ -1510,20 +2480,35 @@ async function main() {
         triggered: false,
         addedToCart: false,
         purchaseMode: null,
-        checkoutPage,
+        checkoutPage: null,
+        preflightPage: null,
+        preflightChallengePending: false,
+        cartRetryPending: false,
+        checkoutPages,
+        context,
+        monitorState,
+        stopCheckoutCartMonitor: null,
         completed: false,
         terminal: false,
         pendingCartReconciliation: false,
+        redirectedCartCheckout: false,
+        needsRearm: false,
+        submittedThisAttempt: false,
         purchaseGuardConfig,
       };
       await attachResponseMonitor(job, monitorState);
       jobs.push(job);
-      await navigateProduct(job, monitorState);
-      await wait(1500);
+      const cartStatus = job.requestedMode === "direct-buy" && !multiDirectBuyEnabled
+        ? await inspectDirectBuyCheckout(job, monitorState)
+        : "empty";
+      if (cartStatus === "empty") {
+        await navigateProduct(job, monitorState);
+      }
+      await wait(multiDirectBuyEnabled ? globalPollDelayMs : 1500);
     }
 
     console.log(
-      `TARGET_MONITOR_STARTED products=${configuredJobs.length} globalPollMs=${globalPollDelayMs} observeOnly=${observeOnly} maxApiPolls=${maximumApiPolls} driver=${browserDriverName}`,
+      `TARGET_MONITOR_STARTED products=${configuredJobs.length} globalPollMs=${globalPollDelayMs} repeatConfirmedOrders=${monitorState.repeatOrdersEnabled()} observeOnly=${observeOnly} maxApiPolls=${maximumApiPolls} driver=${browserDriverName}`,
     );
 
     while (
@@ -1567,7 +2552,11 @@ async function main() {
       console.log("ALL_TARGET_PRODUCTS_COMPLETED");
     }
   } finally {
-    stopCheckoutCartMonitor();
+    clearInterval(heartbeatTimer);
+    for (const job of jobs) {
+      job.stopCheckoutCartMonitor?.();
+      job.stopCartViewMonitor?.();
+    }
     console.log(
       `TARGET_CALIBRATION_SUMMARY ${JSON.stringify({
         ...monitorState.calibrationSummary(),
@@ -1577,8 +2566,10 @@ async function main() {
     if (keepDiagnosticPage) {
       console.log(`TARGET_DIAGNOSTIC_PAGES_PRESERVED count=${jobs.length}`);
     } else {
-      await Promise.all(jobs.map((job) => job.page.close().catch(() => {})));
-      await checkoutPage?.close().catch(() => {});
+      await closeNewProductPages(jobs, initiallyOpenPages);
+      await Promise.all(
+        [...checkoutPages].map((page) => page.close().catch(() => {})),
+      );
     }
     await browser.close().catch(() => {});
   }
@@ -1592,19 +2583,30 @@ if (require.main === module) {
 }
 
 module.exports = {
+  actOnAvailabilityCandidate,
   attachCartResponseMonitor,
   attachResponseMonitor,
+  acquireProductPage,
+  closeNewProductPages,
   continueCheckout,
   createMonitorState,
   findPurchaseButton,
   handleChallenge,
   inspectAndTrigger,
+  inspectDirectBuyCheckout,
   navigateProduct,
   parseJobArgument,
   parseProducts,
   pollAvailability,
+  readCheckoutCartView,
+  rearmConfirmedJob,
   reconcilePendingCart,
+  retryCartPurchase,
   resolveProductArgs,
+  selectProductFulfillment,
   triggerPurchase,
   waitForPausedPages,
+  waitForHydratedPurchaseAction,
+  waitForStableChallengeClear,
+  waitForTargetSignIn,
 };

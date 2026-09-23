@@ -91,6 +91,22 @@ test("solver exceptions are retried and reported as failed", async () => {
   assert.equal(result.error, "hold interrupted");
 });
 
+test("an unsupported challenge uses one attempt per recovery cycle", async () => {
+  let calls = 0;
+  const result = await resolveChallenge({
+    solver: async () => {
+      calls += 1;
+      throw new Error("CHALLENGE_KIND_UNSUPPORTED");
+    },
+    maxAttempts: 3,
+    wait: noWait,
+    verifyCleared: async () => false,
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.attempts, 1);
+  assert.equal(result.outcome, resolutionOutcome.failed);
+});
+
 test("verifyCleared is mandatory", async () => {
   await assert.rejects(
     () => resolveChallenge({ solver: async () => true }),

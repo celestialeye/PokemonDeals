@@ -2,7 +2,7 @@
 
 ## Architecture that worked
 
-Playwright connects to the persistent PokemonDeals Chrome profile through the
+Browser drivers connect to the persistent PokemonDeals Chrome profile through the
 Chrome DevTools Protocol at `http://127.0.0.1:9444`. This avoids foreground-
 input conflicts and allows multiple independent pages and workers to operate
 in the same authenticated browser context without relying on Chrome's protected
@@ -12,22 +12,25 @@ The reliable sequence was:
 
 1. Launch the non-default PokemonDeals user-data directory with
    `--remote-debugging-port=9444`.
-2. Connect with `playwright-core` using `chromium.connectOverCDP`.
+2. Connect with Patchright or `playwright-core` using `chromium.connectOverCDP`.
 3. Open dedicated pages from the existing browser context.
 
 The deals control plane now checks the CDP endpoint before a run and launches
 the persistent Windows Chrome profile automatically when the endpoint is
-missing. Sign-in is a one-time operator step in that profile. Patchright versus
-Playwright remains a Target setting passed through `TARGET_BROWSER_DRIVER`;
-Chrome startup only provides the shared CDP context.
+missing. Sign-in is a one-time operator step in that profile. The Target URL
+watch uses `TARGET_BROWSER_DRIVER`, defaulting to Patchright with a Playwright
+fallback. Legacy Target and Amazon workers use `playwright-core`. Chrome
+startup only provides the shared CDP context.
 
 ## Deals purchasing engine and operating surfaces
 
 The `deals.js` CLI is the shared purchasing engine with two operation surfaces.
 The AI-agent surface uses direct, non-interactive subcommands and is the
-recommended orchestration path: the agent owns catalog changes, starts an
-explicit execution mode, monitors worker events, and reports or stops on
-terminal evidence. The no-argument path lazily loads the in-development
+recommended orchestration path for catalog-backed work: the agent owns catalog
+changes, starts an explicit execution mode, monitors worker events, and reports
+or stops on terminal evidence. Explicit `/target-buy <url>` and
+`/amazon-buy <url>` invocations instead use their guarded one-product skills.
+The no-argument path lazily loads the in-development
 `neo-blessed` full-screen application from `src\deals-tui.js`; direct
 subcommands do not load the TUI and retain their plain-text output. Agent
 operation must use an explicit execution mode rather than inheriting a stored
@@ -39,10 +42,12 @@ adapters own URL recognition, per-retailer armed limits, setting defaults and
 validation, worker arguments, secret-name validation, and output-event parsing.
 This keeps retailer-specific purchase behavior out of the CLI.
 
-The executable adapter registry currently contains Target only. Amazon and
-Pokémon Center still use their legacy direct workers, so the main agent may
-orchestrate them only through their documented commands and required
-environment inputs.
+The executable adapter registry currently contains Target only. Target and
+Amazon one-product purchases use the explicit `/target-buy <url>` and
+`/amazon-buy <url>` repository skills with guarded direct-buy launchers.
+Pokémon Center still uses its legacy direct worker, so the main agent may
+orchestrate it only through its documented command and required environment
+inputs.
 
 The TUI remains a development surface. Its controller boundary is intentionally
 one-way. The TUI builds product
@@ -109,6 +114,19 @@ existing backoff ladder. The CLI parses `TARGET_CHALLENGE_DETECTED`,
 operator-visible item/global status. The solved event includes the product ID so
 stdout/stderr interleaving cannot attribute verified recovery to another
 catalog item.
+The `/target-buy` path additionally refreshes its worker-owned page after a
+failed three-attempt Press & Hold cycle, then re-inspects and continues the
+bounded recovery cycle; legacy watch runs retain the prior no-refresh default.
+Its launcher obtains the product URL only from `user.message.data.content` in
+the active Copilot session's `events.jsonl`, matching `skill.invoked` to that
+user turn. The model-facing transformed skill context may omit invocation
+arguments or contain example URLs; the launcher does not accept a copied URL.
+The direct-buy route formerly enabled a Target-cookie/storage reset after
+failed challenge cycles. The later watchlist run cleared 58 Target cookies
+without proving that the reset resolved verification. Direct-buy and watchlist
+runs now disable automatic session reset and retain the authenticated profile.
+Challenge recovery continues through page inspection, bounded input attempts,
+and backoff without erasing session state.
 
 Catalog and local-secret writes use same-directory temporary files followed by
 rename. `data\deals.json` stores no secrets or authenticated data and is
@@ -133,14 +151,17 @@ profile, cart, and payment state. The three explicit run modes are:
 3. `live-purchase`: permits the existing worker to submit after all of its
    safeguards pass.
 
-Before an active mode starts, any configured item/order price ceilings are
-enforced, and the engine checks for an effective Discord webhook without
-logging its value. Missing ceilings are treated as unlimited. Explicit
-process-environment secrets take precedence over stored values for one-off
-runs. The normal settings view masks stored secrets and reports environment
+Before a catalog-backed active mode starts, any configured item/order price
+ceilings are enforced, and the engine checks for an effective Discord webhook
+without logging its value. Missing catalog ceilings are treated as unlimited.
+The `/target-buy` skill disables Discord alerts and supplies its own `$10000`
+fallbacks when a Target limit is unset. Explicit process-environment secrets
+take precedence over stored values for one-off runs. The normal settings view masks stored secrets and reports environment
 override presence; only the explicit reveal action displays stored values.
-Direct commands stream worker stdout/stderr unchanged; the TUI shows a
-bounded, terminal-control-stripped projection so checkout errors and safety
+Legacy direct commands stream worker stdout/stderr unchanged. The Target
+direct-buy and watchlist launchers buffer complete worker lines and sanitize
+them before terminal output and JSONL logging. The TUI shows a bounded,
+terminal-control-stripped projection so checkout errors and safety
 stops remain visible without allowing worker text to control the interface.
 Existing
 structured and plain Target events update per-item status through product IDs
@@ -225,7 +246,14 @@ No reliable Target-published A/B test or public success-rate dataset was found c
 
 The practical conclusion is that `Buy now` is the preferred first path for one highly competitive item **only when it goes directly to checkout**. Its likely advantage is avoiding a navigation step, not earlier inventory reservation. No evidence establishes a material difference once either path reaches checkout; `Add to cart` followed immediately by checkout is therefore the fallback when `Buy now` is unavailable, errors, or selects the wrong fulfillment method. Reviewing the cart or continuing to shop is the least favorable path because the cart does not protect the item.
 
-This is research guidance, not a verified change to the current workers: `target-watch.js` and `preorder.js` still require and act on a current enabled `Add to cart` or `Preorder` control. If a future checkout path adds `Buy now`, compare method-level outcomes using checkout readiness, order-submission success, and explicit confirmation—not cart-add success alone. Do not race both paths concurrently on the shared Target profile; duplicate cart/order attempts can interfere with one another without improving inventory odds.
+`target-watch.js` supports explicit `buy-now=` jobs through the same guarded
+checkout state machine. The `/target-buy` skill adds a one-product
+`direct-buy=` route that prioritizes Buy Now, then Preorder, then Add to cart;
+bare URL-watch jobs retain their existing Preorder/Add-to-cart preference.
+This priority is an implementation choice, not evidence of a measured success
+rate. Do not race paths concurrently on the shared Target profile; duplicate
+cart/order attempts can interfere with one another without improving inventory
+odds.
 
 ## Price detection
 
@@ -261,7 +289,10 @@ Verification is detected through URL, title, and body-text patterns. The legacy
 workers pause CAPTCHA, robot-check, Press and hold, and access-denied pages for
 manual handling. The Target URL watch alone supports the explicitly configured,
 bounded press-and-hold solver described below; unresolved and unsupported states
-still back off. Its inspection includes visible frames and fails closed on unreadable pages.
+still back off. Its inspection includes visible frames and fails closed on
+unreadable pages unless a unique visible/enabled supported Press & Hold control
+is still exposed, in which case that bounded control is positive evidence for
+the solver.
 
 ### Pokémon Center hCaptcha (live investigation)
 
@@ -320,10 +351,10 @@ The script's broader pattern list covers several possible presentations so it ca
 
 ### Recovery strategy
 
-1. Treat HTTP 403/429, PerimeterX HTML, `Press & Hold`, or visible verification on any Target tab as a shared-session circuit-breaker event.
-2. Pause all Target monitoring and cart mutations for at least five minutes; double the cooldown on repeated challenge events up to thirty minutes.
-3. For the Target URL watch, invoke the configured bounded solver before backoff. If no supported solver is configured or independent verification still finds the challenge, leave it for manual completion; legacy workers remain manual-only.
-4. Verify that the page has returned to a normal Target product, cart, or checkout URL before resuming.
+1. Distinguish page verification or challenged availability responses from a cart-service HTTP 429. The former enter the shared challenge pause; the latter cool cart work while preserving its purchase owner.
+2. Apply the configured challenge backoff after a failed recovery cycle. For cart 429, honor a longer `Retry-After` or the adaptive cart cooldown without labeling successful availability reads as rate limited.
+3. For the Target URL watch, invoke the configured bounded solver before backoff. A generic unsupported kind uses one attempt in a cycle, then is re-inspected in a later cycle. Legacy workers remain manual-only.
+4. Verify that the challenged page has returned to a normal Target product or checkout state before resuming; `/cart` is never inspected as a challenge-recovery page in the direct-buy flow.
 5. Keep product polling globally serialized and stagger initial page loads.
 6. Require a current enabled product action before clicking; network availability alone is only a candidate signal.
 7. If verification recurs, restart the global cooldown rather than refreshing through it.
@@ -332,7 +363,7 @@ Legacy workers must not refresh through or interact with a visible challenge. Th
 
 ## Target URL watch mechanism
 
-The URL-driven monitor accepts one to three Target product jobs and enforces a hard maximum of three. Bare URLs retain automatic Preorder/Add-to-cart selection; explicit `buy-now=url` selects Buy now without allowing the worker to substitute another action. Explicit `preorder=` and `add-to-cart=` are also accepted. Three is the initial cap because the expected release pattern is one to three products and the previous eleven-tab design produced synchronized traffic without confirmed purchases.
+The URL-driven monitor accepts one to three Target product jobs and enforces a hard maximum of three. Bare `target:watch` URL arguments retain automatic Preorder/Add-to-cart selection; explicit `buy-now=url` selects Buy now without allowing the worker to substitute another action. Explicit `preorder=` and `add-to-cart=` are also accepted. The internal `direct-buy=url` action is used by `/target-buy` and the main agent's URL-only purchase route, prioritizing Buy Now, Preorder, then Add to cart for one authorized item. Three is the initial cap because the expected release pattern is one to three products and the previous eleven-tab design produced synchronized traffic without confirmed purchases.
 
 The monitor opens one authenticated tab per product but uses one global scheduler for fulfillment checks and one mutation queue for Add to cart, Preorder, and checkout actions. The request queue permits only one active call, starts the global cooldown after that call completes, and preserves the cooldown after failures. The production default is five seconds plus ±10% jitter; three products therefore receive a serialized round-robin rather than synchronized page activity. The worker captures and replays the page-owned request in browser context, including its HTTP method, POST body, and rotating parameters. On 2026-09-18 the live page used `POST /cdui_orchestrations/v1/pages/pdp/deferred_enrichment/modules`; legacy Redsky GET responses remain supported.
 
@@ -342,19 +373,66 @@ Initial isolated-profile calibration on 2026-09-18 produced these bounded result
 
 The URL watch uses Patchright `1.63.0` by default, with `TARGET_BROWSER_DRIVER=playwright` retaining the matching `playwright-core` fallback. Both attach to the existing Chrome CDP endpoint; Patchright changes the automation driver, not the authenticated-profile requirement or request cadence.
 
-A positive fulfillment field is only a candidate signal. The worker reloads the product page and requires a freshly resolved, visible, enabled `Add to cart` or `Preorder` control before acting. An observe-only Patchright run against available TCIN `1007918679` returned five HTTP 200 responses, classified the monitored product as `IN_STOCK`, selected action `purchase`, and independently found an enabled `Add to cart` control during initial navigation and after every poll. No click or cart mutation occurred. This run also exposed and fixed a classification bug where a zero-valued preorder quantity caused an in-stock purchase item to be mislabeled as preorder. A separate Patchright run against unavailable TCIN `1010892076` returned five HTTP 200 responses, consistently produced `available:false`, `action:null`, and `confidence:"unavailable"`, and reported no enabled purchase control.
+A positive fulfillment field is only a candidate signal. The current worker checks the existing product tab first, then navigates once if no usable control has hydrated. It requires a visible, enabled matching action before input. An observe-only Patchright run against available TCIN `1007918679` returned five HTTP 200 responses, classified the monitored product as `IN_STOCK`, selected action `purchase`, and independently found an enabled `Add to cart` control during initial navigation and after every poll. No click or cart mutation occurred. This run also exposed and fixed a classification bug where a zero-valued preorder quantity caused an in-stock purchase item to be mislabeled as preorder. A separate Patchright run against unavailable TCIN `1010892076` returned five HTTP 200 responses, consistently produced `available:false`, `action:null`, and `confidence:"unavailable"`, and reported no enabled purchase control.
 
 Rapid sequential navigation across several Target search and category pages subsequently produced a visible verification challenge. The earlier fulfillment polling samples did not, so the evidence distinguishes the observed trigger pattern as search-page crawling rather than proving any universal request threshold. `target-preorder-discovery.js` therefore permits one search query per run, performs no pagination or candidate-page navigation, stops on challenge evidence, and persists a 15-minute local cooldown with a hard five-minute floor. A live preorder product has not yet been validated; absence of a returned candidate must not be treated as proof that none exists.
 
 The worker sends a Discord availability alert concurrently with the selected action and handles `Item not added to cart` before any success text. Add/Preorder require explicit cart evidence before the distinct prepared checkout tab takes over; Buy now requires an explicit `buy-now=` job, keeps the original PDP open, and operates the order side panel directly.
 
-A single blank checkout tab is created for active runs but is not navigated to empty checkout. This preserves immediate readiness without repeating the archived extension failure where checkout ran against an empty cart. After a confirmed add, the tab navigates to `/checkout` immediately. The first winning product claims a global transaction lease, so all other polling/cart mutations stop until explicit order confirmation or shared challenge backoff.
+The worker does not pre-create blank checkout tabs. After confirmed
+Preorder/Add-to-cart evidence, it lazily creates one distinct checkout tab and
+navigates it to `/checkout`; Buy now remains on its original product tab. The
+first winning product claims a global transaction lease, so all other
+polling/cart mutations stop until explicit order confirmation or shared
+challenge backoff.
+The dedicated PokemonDeals Chrome bootstrap must not use
+`--restore-last-session`: after a forced worker stop, Chrome's crash-recovery
+restore can resurrect stale verification and blank tabs. It now launches with
+first-run/default-browser prompts disabled and the crashed-session bubble
+suppressed.
 
-The in-process transaction lease is claimed before hover/click input. The existing warning against multiple workers remains important because no cross-process lock was added. Cart handshake, challenge, and shared rate-limit policy remain unchanged, but uncertain post-input outcomes now retain the owner and reconcile that product before another purchase action can run.
+The in-process transaction lease is claimed before hover/click input. The
+`/target-buy` and `/amazon-buy` launchers also share a Windows
+`Local\PokemonDealsPurchase` mutex and reject recognized competing purchase
+workers before launch. Legacy direct commands are not covered by that launcher
+lock, so the warning against multiple workers remains important. Cart handshake
+and challenge ownership remain, while cart-service 429 now uses a separate
+cooldown. Uncertain post-input outcomes retain the owner and reconcile that product before
+another purchase action can run.
 
 Both the dedicated checkout tab and Buy-now side panel use the same state ordering: shared circuit breaker, verification, explicit confirmation, fail-closed safety states, high-demand OK, Save and continue, PIN, Place order, then loaded-page wait/bounded recovery. State, prior state, state-entry time, and last progress are tracked. Replaced non-submit controls are reacquired on the next snapshot; unchanged loaded pages, sign-in or payment setup prompts, unavailable items, empty carts, unexpected items, and a disappearing engaged Buy-now panel stop safely. The worker consumes the existing authenticated shipping/payment state and does not automate account, address, or payment-method setup.
 
-Before the single permitted Place-order attempt, a shared validator requires exactly one expected TCIN, quantity one, detected fulfillment, an optional configured fulfillment match, one unambiguous item price, one unambiguous order total, and required `TARGET_MAX_ITEM_PRICE`/`TARGET_MAX_ORDER_TOTAL` ceilings. `TARGET_STOP_BEFORE_SUBMIT=1` returns a terminal ready-to-submit result after validation without clicking. Once Place order is clicked, page closure, snapshot failure, or any other non-confirmed outcome returns terminal `ambiguous` and does not click it again during that run.
+Before the single permitted Place-order attempt, a shared validator requires
+exactly one expected TCIN, quantity one, detected fulfillment, an optional
+configured fulfillment match, one unambiguous item price, and one unambiguous
+order total. The general Target watch permits unset price ceilings; `/target-buy`
+supplies `$10000` item-price and order-total fallbacks for its one-product run.
+The `/target-buy` path defaults an unset fulfillment preference to Shipping and
+selects only the button inside the product page's Fulfillment region (for
+Shipping, the `SHIPPING` button), never a Shipping & Returns element. It then
+verifies Target marked it selected before purchase input. A click without
+selected-state evidence blocks that attempt rather than emitting
+`TARGET_FULFILLMENT_SELECTED`. Checkout considers only labeled interactive
+fulfillment controls, ignoring shipping-content containers. It may click
+Shipping again, reports the click rather than a selection, and validates
+fulfillment before submission. It does not silently change to another
+fulfillment type. If Target presents a sign-in gate, the worker emits a
+sign-in-required event, waits for visible manual completion, and resumes
+without entering credentials.
+Before choosing a new direct-buy product action, the worker opens `/checkout`
+and reads that page's live cart-view response. Exactly one expected product at
+quantity one proceeds on the checkout page without adding another unit; an
+empty checkout cart resumes the usual Buy Now/Preorder/Add-to-cart priority.
+An unreadable, challenged, extra-item, or mismatched checkout view stops
+safely. The worker does not intentionally open or inspect `/cart`; if Target
+redirects there before submission, it returns to `/checkout`. If verification
+obscures Add-to-cart feedback, the same checkout-only preflight reconciles the
+pending mutation rather than waiting indefinitely for a product-page banner
+or repeating the click.
+`TARGET_STOP_BEFORE_SUBMIT=1` returns a terminal ready-to-submit result after
+validation without clicking. Once Place order is clicked, page closure,
+snapshot failure, or any other non-confirmed outcome returns terminal
+`ambiguous` and does not click it again during that run.
 
 Add-to-cart and Preorder clicks retain the existing response observer, cart reconciliation, shared backoff ladder, and passive cart-response listeners. This focused change did not alter those policies.
 
@@ -362,7 +440,136 @@ Add-to-cart and Preorder clicks retain the existing response observer, cart reco
 
 The focused Buy-now and shared-checkout work is implemented with deterministic offline tests. The tests prove explicit Buy-now selection, original-PDP routing, distinct cart checkout routing after confirmed cart addition, fail-closed purchase validation, bounded checkout recovery, `TARGET_STOP_BEFORE_SUBMIT`, and one-shot Place-order behavior.
 
-This work did not launch a worker, connect to CDP, contact Target or Discord, inspect a profile, or perform a purchase. Offline unit and isolated fixture-browser results do not establish that current authenticated Target markup exposes every identity, quantity, fulfillment, item-price, or total field required by the validator. Operator-run observe-only, stop-before-submit, and explicitly approved purchase validation remain separate evidence gates.
+The 2026-09-19 implementation work did not launch a worker, connect to CDP,
+contact Target or Discord, inspect a profile, or perform a purchase. Offline
+unit and isolated fixture-browser results did not establish that authenticated
+Target markup exposed every field required by the validator. A later live
+direct-buy session did reach and place an order, but the worker reported that
+successful run as ambiguous after PIN confirmation. The order was later
+cancelled according to the user. The timeline, corrections, evidence, and
+remaining confirmation gap are recorded in
+[the 2026-09-23 direct-buy session](./docs/target-direct-buy-2026-09-23.md).
+
+The first-available Target watchlist extends that same watch worker with an
+explicit eight-product mode. One global request queue checks dedicated tabs
+with a one-second shared cooldown; one transaction owner pauses all product
+polling through checkout. On a confirmed order, checkout ownership is
+released, the product's old checkout state is cleared, and the same worker
+resumes all tabs, including that product. The 2026-09-23 overnight run permits
+repeated quantity-one orders only after a fresh Place-order click. Buy Now
+precedes Preorder/Add to cart. An unrelated
+occupied cart disables cart-based fallback while Buy Now monitoring
+continues. The watchlist uses stricter unattended price ceilings and verifies
+an ambiguous post-submit outcome against read-only Target Orders before
+reporting success. Configuration, current limits, and offline/live evidence
+are in [the watchlist design](./docs/target-first-available-watchlist-2026-09-23.md).
+
+### Target stock-window checkout preflight failure (2026-09-23)
+
+At 07:47:45 UTC, the eight-product watchlist recorded shipping `IN_STOCK`
+for `A-1010892076`. At 07:48:02 UTC it stopped at
+`checkout-preflight-cart-view-unreadable` before a product action or
+Place-order click. A one-product attempt reproduced the same stop at
+07:49:44 UTC; that later worker then observed the product unavailable.
+The logs establish a missed purchase attempt, not an order.
+
+Live read-only inspection of the same Chrome session found a successful
+`/web_checkouts/v1/cart_views` response with `summary.items_quantity = 0`
+and no `cart_items` field. Replaying that request inside `page.evaluate`
+failed because Target navigated and destroyed the page execution context.
+The browser context's request client fetched the same endpoint with HTTP 200.
+`readCheckoutCartView()` now uses that context request and normalizes an
+omitted `cart_items` field to an empty list only when the summary quantity
+is zero. The direct-buy run overrides the saved five-second catalog cadence
+with a one-second shared cooldown. Focused regression tests cover the
+context request, the empty-cart omission, and the direct-buy cadence.
+The restarted live worker passed checkout preflight and resumed availability
+polling; no purchase confirmation had occurred at that snapshot.
+The Buy Now path also dropped a hover delay, a fixed five-second post-click
+wait, and a second challenge inspection. The checkout state machine already
+waits for panel state and handles verification. An offline regression test
+shows it is entered without those product-page waits; live Buy Now checkout
+was not exercised while the item remained unavailable.
+An Add-to-cart redirect to `/cart` now hands the same tab to checkout before
+the product challenge inspector runs. The checkout state machine navigates
+to `/checkout` and validates the cart there. A regression test covers this
+handoff and asserts no cart-page inspection or additional checkout tab.
+
+At 08:37 UTC, a fulfillment API response briefly reported shipping stock for
+`A-1010892076`, while product-page controls initially remained disabled or
+unhydrated. A later read-only inspection found an enabled Add to cart button.
+The active watch worker then clicked at 08:39:16 UTC; Target returned HTTP
+429 for the cart mutation, with no confirmed add or order. Stopping that
+worker while watching the button raced its own click. After the recorded
+60-second backoff, a read-only `/checkout` cart view showed zero items.
+For future live intervention, inspect the latest mutation and checkout log
+events before stopping an active worker; let its then-existing 429 backoff and cart
+reconciliation finish when no conflicting purchase input exists. A positive
+availability response alone remains a candidate until the hydrated product
+control is visible and enabled.
+
+At 09:03:44 UTC, `A-1010892067` produced a positive shipping-stock API
+signal. Its product page later showed enabled Add to cart, while
+`TARGET_FULFILLMENT_CONTROL_NOT_FOUND` prevented the worker from clicking.
+Read-only inspection showed Target rendered a selected **Ship to** destination
+and arrival date in the Fulfillment region without the earlier Shipping
+button. Repeated immediate product reloads also encountered the button
+before hydration. A scoped Add-to-cart intervention received HTTP 429; no
+cart addition or order was confirmed. `findProductFulfillmentControl()` now
+recognizes that unique selected-shipping summary, and a positive stock
+candidate gets a bounded wait for the hydrated product action before another
+poll can reload it. Focused and full offline tests passed; an order through
+this new page variant remains live-unverified.
+
+The revised watch worker later acted on `A-1010892078`: shipping stock was
+observed at 10:16:39 UTC and Target returned HTTP 429 to its cart mutation
+at 10:16:45 UTC. This is live evidence that the worker reached the purchase
+input path, not that an item was added. After its 60-second pause, checkout
+reconciliation could not confirm the cart add, so the worker stopped before
+Place order. The watchlist supervisor restarted that pre-submit failure
+after 15 seconds and resumed polling all eight products. No order was
+confirmed in that sequence. Do not infer that faster polling caused Target's
+cart 429 from these events alone.
+
+### Watchlist recovery changes after the overnight run (2026-09-23)
+
+The nine watchlist logs contained 12,541 availability API polls, six
+positive stock signals across three TCINs, two cart-mutation HTTP 429
+responses, and no watchlist Place-order click or order confirmation. The
+last run repeatedly encountered page verification. A generic classification
+led to three immediate unsupported solver attempts, then an automatic reset
+cleared 58 Target cookies. The subsequent Press & Hold attempt failed during
+browser action, and logging was quiet for about 70 minutes. The logs do not
+prove what held up the browser during that gap or that cookie clearing helped.
+
+The revised direct-buy/watchlist code preserves the signed-in Target session.
+Challenge inspection now checks for a unique visible Press & Hold control
+even when generic verification copy is present, uses one shared fallback
+deadline across frames, and records a sanitized browser-action stage on
+failure. Unsupported kinds use one attempt per cycle; the worker remains in
+recovery through later cycles. Preflight checkout challenges retain the
+checkout tab as their owner instead of being cleared by an unrelated product
+tab.
+
+On a positive stock signal, the worker checks the existing product tab before
+navigating. Cart-service 429 cooldown is separate from the challenge pause
+and from availability transport status. `Retry-After` wins when longer than
+the adaptive cart fallback. An uncertain cart click keeps its purchase owner:
+the worker reads `/checkout`, proceeds if the exact item is present, or
+retries a fresh product action after an explicitly empty cart. If the page
+redirects to `/cart`, it returns to `/checkout` before any cart-page
+challenge inspection. The watchlist retains one preflight checkout tab
+while pursuing that product and cleans it up when the product tab takes over
+or the order rearms. Per-product API events record actual poll gaps, and a
+30-second heartbeat reports the owner, cooldown, and last poll age.
+
+These changes passed offline unit tests and JavaScript syntax validation.
+No live retailer checkout was run as a development check. A future natural
+stock window is needed to measure signal-to-action timing, current Target
+markup, verification recovery, and order confirmation. The worker still
+cannot claim that a generic challenge is solved without independent page
+clearance; a post-Place-order ambiguity requires read-only order-history
+reconciliation before another submission.
 
 Discord credentials remain in `DISCORD_WEBHOOK_URL` and are passed to the Python `discord.py` helper through the child-process environment, never command arguments or source files.
 
@@ -383,9 +590,12 @@ Integration corrections:
 
 - Post-click solving runs inside the existing mutation instead of awaiting a new
   mutation queued behind itself. Other challenge entry points still enqueue.
-- Independent inspection now includes visible frames; empty, closed, unreadable,
-  or excessive-frame states cannot count as clearance. Detection also recognizes
-  the `Press and hold` spelling without weakening earlier patterns.
+- Independent inspection now includes visible frames; empty, closed, or
+  excessive-frame states cannot count as clearance. An unreadable frame can
+  still expose a unique visible/enabled supported Press & Hold control; that
+  control is allowed as bounded positive evidence for solver invocation, while
+  missing or ambiguous controls remain blocked. Detection also recognizes the
+  `Press and hold` spelling without weakening earlier patterns.
 - All verified recovery paths invalidate stale request/availability state.
 - Normal observe-only calibration still stops on challenged API responses. The
   explicit `TARGET_CHALLENGE_VALIDATE=1` mode defers that stop while the current

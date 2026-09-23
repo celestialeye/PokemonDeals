@@ -5,6 +5,7 @@ const {
   isCartSuccess,
   isPurchaseAction,
   normalizeRequestedPurchaseMode,
+  directBuyPurchaseModeOrder,
   productIdFromUrl,
   productMonitorTabPolicy,
   productPurchaseSelector,
@@ -41,6 +42,7 @@ assert.equal(isPurchaseAction("Ship it"), false);
 assert.equal(normalizeRequestedPurchaseMode("pre-order"), "preorder");
 assert.equal(normalizeRequestedPurchaseMode("add to cart"), "add-to-cart");
 assert.equal(normalizeRequestedPurchaseMode("Buy Now"), "buy-now");
+assert.equal(normalizeRequestedPurchaseMode("direct buy"), "direct-buy");
 assert.equal(purchaseModeFromLabel("Preorder"), "preorder");
 assert.equal(
   selectPurchaseCandidate(
@@ -60,7 +62,22 @@ assert.equal(
   ).label,
   "Preorder",
 );
+assert.equal(
+  selectPurchaseCandidate(
+    [
+      { label: "Add to cart" },
+      { label: "Preorder" },
+      { label: "Buy now" },
+    ],
+    "direct-buy",
+  ).label,
+  "Buy now",
+);
 assert.equal(selectPurchaseCandidate([{ label: "Buy now" }], "auto"), null);
+assert.deepEqual(
+  directBuyPurchaseModeOrder,
+  ["buy-now", "preorder", "add-to-cart"],
+);
 assert.equal(productMonitorTabPolicy, "one-per-product");
 assert.equal(
   productIdFromUrl("https://www.target.com/p/pokemon/-/A-1010892075"),

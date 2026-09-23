@@ -197,6 +197,7 @@ function targetWorkerMode(mode) {
     "buy-now": "buy-now",
     preorder: "preorder",
     buy: "add-to-cart",
+    "direct-buy": "direct-buy",
   }[mode];
   if (!mapped) {
     throw new Error("Target mode must be Buy Now, Preorder, or Buy.");
@@ -231,7 +232,10 @@ function buildTargetRun(items, executionMode, {
 
 function validateTargetEnvironment(executionMode, env = process.env) {
   const mode = normalizeExecutionMode(executionMode);
-  if (mode === "observe-only") {
+  const alertsDisabled = /^(?:1|true|yes)$/i.test(
+    env.TARGET_DISABLE_DISCORD_ALERTS || "",
+  );
+  if (mode === "observe-only" || alertsDisabled) {
     return [];
   }
   return [

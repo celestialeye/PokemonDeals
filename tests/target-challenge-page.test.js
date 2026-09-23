@@ -18,23 +18,70 @@ test("hidden stale frames do not block an otherwise readable product page", asyn
 
 test("normal product is clear but empty, closed, and unreadable pages are blocked", async () => {
   assert.equal((await inspectChallenge(fakePage({ body: "Pokemon product" }))).detected, false);
-  for (const page of [fakePage({ body: "" }), fakePage({ readError: true }), fakePage({ body: "Product", url: "about:blank" })]) {
+  for (const page of [
+    fakePage({ body: "", controls: [] }),
+    fakePage({ readError: true, controls: [] }),
+    fakePage({ body: "Product", url: "about:blank", controls: [] }),
+  ]) {
     assert.equal((await inspectChallenge(page)).unreadable, true);
   }
-  const closed = fakePage({ body: "Product" });
+  const closed = fakePage({ body: "Product", controls: [] });
   closed.state.closed = true;
   assert.equal((await inspectChallenge(closed)).unreadable, true);
 });
 
 test("an unreadable visible frame cannot produce false clearance", async () => {
-  const page = fakePage({ body: "Product", children: [fakePage({ readError: true })] });
+  const page = fakePage({
+    body: "Product",
+    controls: [],
+    children: [fakePage({ readError: true, controls: [] })],
+  });
   assert.equal((await inspectChallenge(page)).unreadable, true);
 });
 
 test("inspection deadline handles stalled page reads without trusting blank evidence", async () => {
-  const page = fakePage();
+  const page = fakePage({ controls: [] });
   page.title = () => new Promise(() => {});
   assert.equal((await inspectChallenge(page, { timeoutMs: 20 })).unreadable, true);
+});
+
+test("fallback control discovery shares one deadline across visible frames", async () => {
+  const children = Array.from({ length: 16 }, () => fakePage({ controls: [] }));
+  const page = fakePage({ controls: [], children });
+  page.title = async () => { throw new Error("unreadable title"); };
+  for (const scope of [page, ...children]) {
+    const slowEmpty = () => ({
+      count: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return 0;
+      },
+    });
+    scope.getByRole = slowEmpty;
+    scope.getByText = slowEmpty;
+  }
+  const started = Date.now();
+  assert.equal((await inspectChallenge(page, { timeoutMs: 20 })).unreadable, true);
+  assert.ok(Date.now() - started < 120);
+});
+
+test("a unique exposed Press and Hold control is actionable even when frame text is unreadable", async () => {
+  const page = fakePage({ body: "", controls: [{ name: "Press and hold" }] });
+  assert.deepEqual(await inspectChallenge(page), {
+    detected: true,
+    kind: "press_and_hold",
+  });
+});
+
+test("generic verification copy yields to a visible Press and Hold control", async () => {
+  const page = fakePage({
+    body: "Verify you are human",
+    controls: [],
+    children: [fakePage({
+      body: "Verification is required",
+      controls: [{ name: "Press & Hold" }],
+    })],
+  });
+  assert.equal((await inspectChallenge(page)).kind, "press_and_hold");
 });
 
 test("excessive visible frame trees fail closed", async () => {

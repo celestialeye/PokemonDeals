@@ -113,7 +113,9 @@ function chromeLaunchArguments({
     `--profile-directory=${profileDirectory}`,
     `--remote-debugging-port=${port}`,
     "--remote-allow-origins=*",
-    "--restore-last-session",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-session-crashed-bubble",
   ];
 }
 
