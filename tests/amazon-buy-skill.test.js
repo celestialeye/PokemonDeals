@@ -31,7 +31,29 @@ test("amazon-buy skill declares the guarded one-product purchase workflow", () =
   assert.match(skill, /Final sale/);
   assert.match(skill, /10000/);
   assert.match(skill, /shell ID `amazon-buy`/);
+  assert.match(skill, /\/skills info amazon-buy/);
+  assert.match(skill, /-AmazonUrl/);
+  assert.match(skill, /Double any embedded apostrophes/i);
+  assert.match(skill, /device-local/);
+  assert.match(skill, /AMAZON_SUPPLIED_CHECKOUT_REPLACED/);
+  assert.match(skill, /AMAZON_ORDER_CONFIRMATION_AMBIGUOUS/);
   assert.doesNotMatch(skill, /offeringID=[A-Za-z0-9%+/=]+/);
+});
+
+test("amazon-buy guide explains device-local setup and safe-stop states", () => {
+  const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
+  const amazonSection = readme
+    .split(/^## Amazon direct buy and preorder\r?$/m)[1]
+    ?.split(/^## Amazon multi-product monitoring\r?$/m)[0];
+
+  assert.ok(amazonSection, "Amazon direct-buy guide must exist");
+  assert.match(amazonSection, /\/skills info amazon-buy/);
+  assert.match(amazonSection, /POKEMON_CHROME_USER_DATA_DIR/);
+  assert.match(amazonSection, /device-local/);
+  assert.match(amazonSection, /AMAZON_SUPPLIED_CHECKOUT_REPLACED/);
+  assert.match(amazonSection, /AMAZON_ORDER_CONFIRMATION_AMBIGUOUS/);
+  assert.match(amazonSection, /amazon:checkout/);
+  assert.doesNotMatch(amazonSection, /F:\\Repos\\personal\\temp\\PokemonDeals/i);
 });
 
 test("amazon-buy runner uses the repository worker and shared safe CDP bootstrap", () => {
@@ -43,6 +65,7 @@ test("amazon-buy runner uses the repository worker and shared safe CDP bootstrap
   assert.match(runner, /\[decimal\]\$MaxOrderTotal = 10000/);
   assert.match(runner, /\$env:AMAZON_PRODUCT_URL = \$AmazonUrl/);
   assert.match(runner, /\$env:AMAZON_CHECKOUT_URL = \$AmazonUrl/);
+  assert.match(runner, /\[string\]\$AmazonUrl/);
   assert.match(runner, /parseAmazonBuyUrl/);
   assert.match(runner, /require\("\.\/src\/chrome-cdp"\)/);
   assert.match(runner, /ensureChromeCdp/);

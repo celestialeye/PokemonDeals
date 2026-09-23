@@ -18,6 +18,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
 $logDirectory = Join-Path $repoRoot "logs"
 $runTimestamp = Get-Date -Format "yyyyMMdd-HHmmssfff"
+# Each run gets a separate local log; the worker inherits this same path.
 $env:AMAZON_RUN_LOG_PATH = Join-Path (
   New-Item -ItemType Directory -Path $logDirectory -Force
 ).FullName "amazon-buy-$runTimestamp-$PID.jsonl"
@@ -31,6 +32,7 @@ Push-Location $repoRoot
 function Protect-AmazonLogText {
   param([AllowNull()][object]$Value)
 
+  # The launcher and worker both redact before logging; never log $AmazonUrl.
   return ([string]$Value) `
     -replace '(?i)(https://(?:www\.)?amazon\.com/(?:checkout|gp/buy)(?:/[^\s"''<>?]*)?)\?[^\s"''<>]*', '$1?<redacted>' `
     -replace '(?i)("(?:offeringID|offerListingID|AMAZON_CHECKOUT_URL|authorization|proxy-authorization|cookie|set-cookie|session-token|x-amz-security-token)"\s*:\s*)"(?:\\.|[^"\\])*"', '$1"<redacted>"' `
@@ -80,6 +82,7 @@ try {
   }
   Write-AmazonRunEvent -Level "info" -Event "AMAZON_LAUNCHER_LOCK_ACQUIRED"
 
+  # Clear inherited inputs so exactly one URL can reach the worker.
   Remove-Item Env:AMAZON_CHECKOUT_URL -ErrorAction SilentlyContinue
   $env:AMAZON_PRODUCT_URL = $AmazonUrl
   $env:AMAZON_MAX_ITEM_PRICE = $MaxItemPrice.ToString(
@@ -99,6 +102,7 @@ try {
   $inputType = [string]$inputMetadata.type
   $inputAsin = [string]$inputMetadata.asin
   if ($inputType -eq "checkout") {
+    # Only the worker compares the supplied token with a live Amazon offer.
     $env:AMAZON_CHECKOUT_URL = $AmazonUrl
     Remove-Item Env:AMAZON_PRODUCT_URL
   } elseif ($inputType -ne "product") {
@@ -121,6 +125,7 @@ try {
 
   $workerPattern =
     '(?i)(?:^|[\s\\/"])(?:amazon-preorder|amazon-checkout|amazon-multi-preorder)\.js(?:["\s]|$)'
+  # Directly launched workers do not hold our mutex; refuse to race them.
   $workers = @(
     Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
       Where-Object { $_.CommandLine -match $workerPattern }
@@ -157,6 +162,7 @@ try {
       $env:AMAZON_MAX_ITEM_PRICE,
       $env:AMAZON_MAX_ORDER_TOTAL
   )
+  # Keep npm attached and hold the mutex until the purchase worker exits.
   npm run amazon:direct-buy
   $workerExitCode = $LASTEXITCODE
   Write-AmazonRunEvent `

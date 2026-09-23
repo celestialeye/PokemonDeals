@@ -147,7 +147,8 @@ scripts and redirected input. See
 Install dependencies:
 
 ```powershell
-Set-Location 'F:\Repos\personal\temp\PokemonDeals'
+# Run from the root of your own PokemonDeals clone (the directory with package.json).
+Set-Location 'C:\path\to\PokemonDeals'
 npm install
 ```
 
@@ -734,24 +735,202 @@ challenge has been completed manually and the normal retailer page is visible.
 
 ## Amazon direct buy and preorder
 
-The project skill can run the complete single-product flow:
+`/amazon-buy` is the **single-product, guarded direct Buy Now** workflow. It
+is a project skill in
+[`.github\skills\amazon-buy\SKILL.md`](./.github/skills/amazon-buy/SKILL.md),
+not a global Copilot installation or a `pokemon` TUI action. It can submit
+one real order; merely discussing a product or pasting a URL does not
+authorize a purchase.
+
+### Set up each Windows device
+
+1. Clone or update **this repository** on the device; install Node.js 20+
+   and Google Chrome. Start Copilot CLI in that clone's root (the directory
+   with `package.json`), not in a different clone or your home directory:
+
+   ```powershell
+   Set-Location 'C:\path\to\PokemonDeals' # Replace with your clone's path.
+   npm install
+   copilot
+   ```
+
+   Trust the repository when prompted. In an existing session after updating
+   the skill, run `/skills reload`; check `/skills info amazon-buy` to verify
+   that it loads from this clone. If it is missing, use `/skills list` and
+   check the current directory before attempting a purchase. The launcher
+   installs dependencies only when `playwright-core` is missing, but
+   `npm install` is the normal first-time setup.
+2. Sign in to Amazon on **this device's** Chrome profile. The launcher reuses
+   an existing CDP endpoint at `http://127.0.0.1:9444` and its first browser
+   context, even if it is a different profile than the one configured below.
+   If CDP is unavailable, [`src\chrome-cdp.js`](./src/chrome-cdp.js)
+   starts a dedicated persistent Chrome profile under
+   `%LOCALAPPDATA%\PokemonDeals\Chrome User Data` (profile `Default`). It
+   does **not** copy authentication from another device or close unrelated
+   Chrome windows. On a new profile, complete sign-in in the visible browser
+   when the worker reports `AMAZON_SIGN_IN_REQUIRED`; it then resumes itself.
+3. If Chrome is in a different location, or you intentionally use a
+   different **dedicated** profile, set `POKEMON_CHROME_PATH`,
+   `POKEMON_CHROME_USER_DATA_DIR`, and/or
+   `POKEMON_CHROME_PROFILE_DIRECTORY` in the PowerShell session **before
+   starting Copilot CLI**; see [Start Chrome for Playwright](#start-chrome-for-playwright).
+   An already-running CDP endpoint takes precedence over these overrides.
+   If that dedicated profile is already open without debugging, Chrome may
+   refuse a second instance: close only that profile, then let the launcher
+   start it with CDP. Never kill unrelated Chrome sessions to make CDP work.
+   You can check availability without placing an order:
+
+   ```powershell
+   Invoke-RestMethod 'http://127.0.0.1:9444/json/version'
+   ```
+
+### Invoke and supply the URL
+
+From a Copilot CLI session in this clone, explicitly request:
 
 ```text
-/amazon-buy <Amazon product or direct Buy Now checkout URL>
+/amazon-buy https://www.amazon.com/dp/<ASIN>
 ```
 
-After adding or updating the skill during an active Copilot CLI session, run
-`/skills reload` once. Invoking `/amazon-buy` authorizes one quantity-one order
-for the supplied ASIN. Product URLs may use `/dp/ASIN` or `/gp/product/ASIN`.
-Direct Buy Now URLs may use `/checkout/entry/buynow` and must contain one valid
-`asin`, `offeringID`, `quantity=1`, and `buyNow=1`. The flow uses fixed
-`$10000` item-price and order-total fail-safe ceilings, ignores
-return-policy text such as `Final sale`, and never selects a third-party seller.
+Replace `<ASIN>` with one real 10-character ASIN. `/gp/product/<ASIN>` is
+also supported. Alternatively pass **one** current Amazon
+`/checkout/entry/buynow` URL to `/amazon-buy` in the CLI; do not put a real
+checkout URL or offer token in documentation, source code, a ticket, or a
+log. The parser accepts `amazon.com` without a scheme and `https://amazon.com`
+or `https://www.amazon.com`, but requires HTTPS and exactly one valid product
+path or Buy Now link. A Buy Now link must contain exactly one valid `asin`,
+one `offeringID`, `quantity=1`, and `buyNow=1`; extra query parameters do
+not bypass offer validation. The supplied link is **not** visited as-is:
+the worker derives `/dp/<ASIN>`, verifies the current Amazon offer, and
+rebuilds the checkout URL with its current token. It keeps an optional
+`tag` parameter but drops unrelated parameters. If the supplied token is
+stale or differs, a newly verified eligible token replaces it.
 
-The equivalent direct command is:
+Invocation authorizes **one quantity-one order** for that ASIN. The skill
+passes `$10000` for both the item-price and order-total fail-safe ceilings;
+these are limits, not a quoted price. It ignores return-policy text such as
+`Final sale` and `No returns`, but never substitutes a third-party seller or
+relaxes the identity, quantity, or price checks. Stop other purchase workers
+against the same Chrome profile before invoking; the launcher refuses to
+run alongside another Amazon purchase worker rather than terminating it.
+
+The launcher runs the worker as an **attached** asynchronous PowerShell
+process with shell ID `amazon-buy`. It owns the run until completion; ask
+Copilot to stop that session if you want to stop monitoring. Stopping a run
+after a Place order click is **not** evidence the order failed: inspect
+Amazon's Orders page before authorizing any new attempt.
+The launcher command in the [skill instructions](./.github/skills/amazon-buy/SKILL.md)
+passes the URL as a single-quoted PowerShell literal; double any embedded
+apostrophes in that literal so they are passed unchanged, and do not split
+checkout links at `&`.
+
+### What the scripts do
+
+| Component | Responsibility |
+|---|---|
+| [Skill instructions](./.github/skills/amazon-buy/SKILL.md) | Require explicit authorization, one input URL, one guarded worker, and safe status/stop handling. |
+| [PowerShell launcher](./.github/skills/amazon-buy/run-amazon-buy.ps1) | Classify the URL without printing its token; set `AMAZON_PRODUCT_URL` **or** `AMAZON_CHECKOUT_URL`, the two $10000 limits, a unique run log, and a named mutex; reject competing Amazon workers; bootstrap CDP; keep `npm run amazon:direct-buy` attached until exit. `-AmazonUrl` accepts either URL (`-ProductUrl` is a legacy alias). |
+| [`src\amazon-offers.js`](./src/amazon-offers.js) | Parse input URLs; define offer-field selectors, seller/shipper/price checks, token comparison, and canonical quantity-one Buy Now URL construction. The worker reads the live offer fields. |
+| [`src\chrome-cdp.js`](./src/chrome-cdp.js) | Reuse port 9444 or start the device-local dedicated Chrome profile; do not close another Chrome profile. |
+| [`amazon-preorder.js`](./amazon-preorder.js) | Own offer discovery, checkout retries, sign-in/verification pauses, final checkout evidence, a single normal submission, and confirmation. `amazon:preorder` is an alias. |
+| [`amazon-checkout.js`](./amazon-checkout.js) | Share unavailable/verification/duplicate/confirmation detectors with direct buy; its separate **checkout-only** command does not perform live offer, item-price, quantity, and total revalidation. Never substitute it for `/amazon-buy`. |
+| [`src\amazon-run-log.js`](./src/amazon-run-log.js) | Redact recognized sensitive values in console events and the JSONL run log. |
+
+Do not use `npm run amazon:checkout` to work around a blocked or ambiguous
+direct-buy run: that checkout-only command does not enforce the skill's
+live offer and final checkout guards.
+
+The direct-buy state machine, in order:
+
+1. Create the local run log and acquire the launcher lock. Clear inherited
+   conflicting inputs, validate exactly one product **or** Buy Now URL,
+   extract its ASIN, check for competing Amazon workers, and attach to CDP.
+2. Visit the product page. Try the Buy Box, then See All Buying Options or
+   the offer-listing page. Require matching ASIN, enabled purchase control,
+   current offer token, price within `AMAZON_MAX_ITEM_PRICE`, **Ships from
+   Amazon** and **Sold by Amazon**. A button offered by a third-party seller
+   does not qualify. The buying-options Add to Cart control is used as a
+   readiness signal; the worker **never clicks it**.
+3. If none qualifies, wait at least **2 seconds** (default
+   `AMAZON_RETRY_DELAY_MS=2000`, minimum 1000) **plus** a one-second page-settle
+   wait and navigation time before checking again; do not enter checkout.
+   Once eligible, construct a direct Buy Now link with the current offer
+   token instead of adding to the cart.
+4. On quantity/update/out-of-stock/selected-seller-unavailable checkout
+   pages, retry the direct URL after a **one-second additional delay** on
+   top of the one-second page-settle wait and navigation time. Every ten
+   such responses revisit the product, switch to a rotated qualifying
+   token, or discard stale checkout and resume product monitoring when
+   no qualifying offer remains. Click Continue or Continue shopping when
+   Amazon requires it. On sign-in, CAPTCHA, MFA, or verification, pause
+   refreshes while the user completes the visible step.
+5. Before clicking Place order, require the active checkout link to match
+   the verified offer/ASIN, **one visible matching checkout line item**,
+   quantity one, a detected current item price within
+   `AMAZON_MAX_ITEM_PRICE`, and a detected order total within
+   `AMAZON_MAX_ORDER_TOTAL`. Missing or changed evidence is a **terminal
+   block**, not permission to try a different product.
+6. Click the normal Place order control **at most once per run**. Only if
+   Amazon explicitly presents a recent-purchase/duplicate-order warning
+   after that attempt may the worker tick its affirmative consent and
+   click one order-anyway confirmation. A successful click is **not** a
+   confirmed order: wait for explicit placed-order text or a thank-you URL
+   with order-number evidence. If the result is still unknown after
+   **60 seconds**, the page closes, or a post-click error occurs, stop as
+   ambiguous without a second submission. Sign-in/verification pauses
+   take priority over this timer; once cleared, an elapsed timer may cause
+   an immediate ambiguous stop.
+
+### Status, safe stops, and logs
+
+| Event | Interpretation / operator action |
+|---|---|
+| `AMAZON_LOG_FILE` | Local, clickable URL of the run's gitignored JSONL log; launcher and worker print the **same** file. Keep for local incident review. |
+| `AMAZON_INPUT_ACCEPTED`, `AMAZON_BUY_STARTED`, `AMAZON_RUN_STARTED` | Launcher accepted the URL and started the guarded worker; **not** an order. |
+| `AMAZON_CDP_REUSED` / `AMAZON_CDP_READY` | Reused an existing Chrome CDP context / started the dedicated profile on this device. Neither event proves that Amazon is signed in. |
+| `AMAZON_PRODUCT_REFRESH` | No qualifying Amazon offer now; keep monitoring, even if a cheaper third-party offer exists. |
+| `AMAZON_SUPPLIED_CHECKOUT_VERIFIED` / `AMAZON_SUPPLIED_CHECKOUT_REPLACED`, `AMAZON_DIRECT_CHECKOUT_FOUND` | Current offer matched/replaced the supplied token; constructed a direct checkout URL and is attempting navigation, **not** cart or a completed order. |
+| `AMAZON_CHECKOUT_REFRESH`, `AMAZON_OFFER_TOKEN_REFRESHED`, `AMAZON_OFFER_REVALIDATION_FAILED` | Unavailable checkout retry; switched to a fresh offer; or revoked checkout and resumed product monitoring. No manual retry needed. |
+| `AMAZON_CONTINUE_CLICKED` | Advanced a retry/interstitial page, not a completed purchase. |
+| `AMAZON_SIGN_IN_REQUIRED`, `AMAZON_VERIFICATION_REQUIRED` (then `*_CLEARED`) | Complete the visible Chrome sign-in/challenge; the worker is already paused and resumes itself when it clears. Do not start another worker. |
+| `AMAZON_DIRECT_BUY_RECONNECT` | Recoverable **pre-submission** browser/navigation error; inspect CDP and the run log if persistent. |
+| `AMAZON_ORDER_GUARDS_VALIDATED`, `AMAZON_PLACE_ORDER_CLICKED`, `AMAZON_DUPLICATE_ORDER_CONFIRMED` | Final guards passed; one submission attempted; or explicit duplicate consent submitted. **None proves success.** |
+| `AMAZON_ORDER_CONFIRMED` | Report success only after this event **and** a zero exit code (`AMAZON_WORKER_EXIT`, `AMAZON_LAUNCHER_COMPLETED`). Stop any other purchase workers. |
+| `AMAZON_ORDER_BLOCKED` | Safety evidence missing/changed or limit exceeded. Report the exact reason; do not restart to evade the guard. |
+| `AMAZON_ORDER_CONFIRMATION_AMBIGUOUS`, `AMAZON_DUPLICATE_ORDER_CONFIRMATION_AMBIGUOUS` | Submission may have happened but cannot be proven. **Never restart or click again automatically**; check Amazon Orders before any new authorization. |
+| `AMAZON_LAUNCHER_FAILED` | Startup failed (e.g., competing worker, missing Chrome/CDP); read the safe-stop reason, fix that prerequisite, and obtain fresh authorization rather than bypassing the launcher. |
+
+The launcher acquires a **device-local** exclusive named mutex for
+`/amazon-buy` invocations and checks for `amazon-preorder.js`,
+`amazon-checkout.js`, and `amazon-multi-preorder.js` processes **on that
+device** before starting. It cannot detect workers running on another
+device using the same Amazon account. Stop an earlier worker on the other
+device and check Amazon Orders for an attempted submission before starting
+a new run here; never rely on the mutex to prevent cross-device duplicates.
+The launcher never terminates unrelated work. The worker records retries,
+token changes, pauses, and submission state as JSONL events under gitignored
+`logs\`. Known checkout URLs, offer tokens, cookies, authorization values,
+and order numbers are
+redacted from those events; page bodies and account details are not logged.
+Treat the file as local sensitive diagnostic data and inspect it before
+sharing. `AMAZON_PRODUCT_REFRESH` and `AMAZON_CHECKOUT_REFRESH` print on
+the first attempt and every tenth attempt, not on every retry; silence
+between events does not mean the worker stopped. Interrupted processes
+may have no terminal log event. An unrecognized Amazon checkout page with
+no known unavailable text or ready Continue/Place order control is left
+open while the worker waits; if it stays there, inspect the visible page
+**read-only** and report the state instead of starting a second worker or
+clicking checkout controls manually.
+
+### Running the worker directly (not the skill)
+
+Only do this if you intentionally want to operate a live purchase worker
+without the skill's mutex/CDP bootstrap; first ensure port 9444 serves the
+correct signed-in context. The worker's **own defaults are $30 per item and
+$40 per order**, not the skill's `$10000` ceilings. From the clone root,
+set the desired limits and **exactly one** URL environment variable:
 
 ```powershell
-Set-Location 'F:\Repos\personal\temp\PokemonDeals'
 Remove-Item Env:AMAZON_CHECKOUT_URL -ErrorAction SilentlyContinue
 $env:AMAZON_PRODUCT_URL = '<Amazon product URL>'
 $env:AMAZON_MAX_ITEM_PRICE = '10000'
@@ -759,63 +938,12 @@ $env:AMAZON_MAX_ORDER_TOTAL = '10000'
 npm run amazon:direct-buy
 ```
 
-For a direct Buy Now URL, set `AMAZON_CHECKOUT_URL` instead of
-`AMAZON_PRODUCT_URL`:
-
-```powershell
-Set-Location 'F:\Repos\personal\temp\PokemonDeals'
-Remove-Item Env:AMAZON_PRODUCT_URL -ErrorAction SilentlyContinue
-$env:AMAZON_CHECKOUT_URL = '<current Amazon direct Buy Now URL>'
-$env:AMAZON_MAX_ITEM_PRICE = '10000'
-$env:AMAZON_MAX_ORDER_TOTAL = '10000'
-npm run amazon:direct-buy
-```
-
-`amazon:preorder` remains an alias for the same worker.
-The worker derives the ASIN from either accepted URL form.
-`AMAZON_EXPECTED_ASIN` can enforce an explicit matching ASIN, and
-`AMAZON_EXPECTED_TITLE` can provide an additional checkout identity check.
-The `/amazon-buy` launcher reuses CDP on port `9444`. If it is unavailable, it
-launches the documented dedicated PokemonDeals Chrome profile with CDP enabled
-without closing unrelated Chrome sessions.
-
-The Amazon direct-buy worker:
-
-1. Opens the supplied product URL, or derives the product page from a supplied direct Buy Now URL.
-2. Reads the main Buy Box and, when necessary, See All Buying Options or Amazon's offer-listing page.
-3. Accepts only a current offer that is both shipped from and sold by Amazon, matches the expected ASIN, exposes an active purchase control and offer token, and does not exceed `AMAZON_MAX_ITEM_PRICE`.
-4. Accepts a supplied direct Buy Now token only when it matches the verified
-   current Amazon offer, then constructs a canonical checkout URL from the
-   validated ASIN and token without preserving unrelated query parameters or
-   clicking Add to cart.
-5. Refreshes and retries when no qualifying Amazon offer is available.
-6. Refreshes the direct checkout URL once per second while quantity, update, or unavailable-item errors remain.
-7. Rechecks the product offer after every ten unavailable checkout responses,
-   switches to a newly issued token when Amazon rotates it, and discards the
-   checkout if no qualifying Amazon offer remains.
-8. Clicks Continue or Continue shopping on Amazon retry/interstitial pages.
-9. Pauses for manual completion of sign-in, robot checks, or CAPTCHA challenges.
-10. Confirms an explicit Amazon duplicate-order warning when Amazon says the item was recently purchased, including affirmative checkbox/radio controls and one order-anyway confirmation.
-11. Refuses to place an order unless the current checkout proves the expected
-    ASIN or exact expected title, quantity one, and a current item price within
-    `AMAZON_MAX_ITEM_PRICE`.
-12. Blocks final submission unless the checkout order total is detected and
-    does not exceed `AMAZON_MAX_ORDER_TOTAL`.
-13. Clicks the normal Place your order control at most once; a duplicate-order confirmation is allowed only inside an explicit duplicate warning.
-14. Stops successfully only after detecting an Amazon order confirmation.
-
-### Amazon run logs
-
-Every Amazon purchase worker writes a timestamped JSONL event log under the
-gitignored `logs/` directory. `/amazon-buy` prints an `AMAZON_LOG_FILE` URL at
-startup so the exact file can be opened later. The log includes launcher setup,
-offer discovery, checkout retries, token refresh events, verification/sign-in
-pauses, duplicate-order confirmation, submission, process exit, and terminal
-outcome.
-
-Checkout URLs, offer tokens, order numbers, authorization values, cookies, and
-session tokens are redacted before writing. Page bodies and account details are
-not recorded.
+For a supplied Buy Now link instead, remove `AMAZON_PRODUCT_URL` and set
+`AMAZON_CHECKOUT_URL` in your local environment (never in a saved script).
+`AMAZON_EXPECTED_ASIN` can enforce an explicit matching ASIN;
+`AMAZON_EXPECTED_TITLE` is an additional scoped checkout-identity fallback
+if an ASIN is not visible. The skill launcher clears both overrides so
+inherited values cannot silently change the authorized ASIN.
 
 ## Amazon multi-product monitoring
 
@@ -823,7 +951,6 @@ Use the multi-product worker when several Amazon product pages must remain
 active at once:
 
 ```powershell
-Set-Location 'F:\Repos\personal\temp\PokemonDeals'
 $env:AMAZON_PRODUCTS_JSON = @'
 [
   {
@@ -870,9 +997,10 @@ Amazon checkout URLs contain short-lived execution identifiers. Supply the curre
 This lower-level `amazon:checkout` worker is not used by `/amazon-buy`; the
 skill routes supplied Buy Now URLs through `amazon:direct-buy` so product,
 seller, shipper, item-price, and order-total guards remain active.
+It does **not** independently enforce those direct-buy guards; do not use it
+to bypass a blocked or ambiguous `/amazon-buy` run.
 
 ```powershell
-Set-Location 'F:\Repos\personal\temp\PokemonDeals'
 $env:AMAZON_CHECKOUT_URL = '<current Amazon checkout URL>'
 npm run amazon:checkout
 ```

@@ -121,6 +121,7 @@ function normalizeAmazonOfferListingId(value) {
     return null;
   }
 
+  // Hidden inputs may encode a token that URLSearchParams has already decoded.
   try {
     return decodeURIComponent(encodedValue);
   } catch {
@@ -151,6 +152,7 @@ function buildDirectBuyUrl(asin, offerListingId, options = {}) {
 
   let decodedOfferListingId;
   try {
+    // URLSearchParams re-encodes once; never carry over a supplied checkout URL.
     decodedOfferListingId = decodeURIComponent(encodedOfferListingId);
   } catch (error) {
     throw new Error(`Amazon offer listing ID is not valid URL encoding: ${error.message}`);
@@ -176,6 +178,7 @@ function parseOfferPrice(text) {
 
 function isQualifyingAmazonOffer(text, maxItemPrice) {
   const normalizedText = text.replace(/\s+/g, " ");
+  // Amazon shipping alone does not qualify an offer sold by a third party.
   const sellerControlSaysAmazon =
     /add to cart from seller amazon\.com/i.test(normalizedText);
   const shipsFromAmazon =

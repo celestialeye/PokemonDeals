@@ -255,7 +255,7 @@ Very aggressive refresh and click loops coincided with repeated retailer verific
 
 - Target checkout: wait up to 1 second for actionable content, then wait 1 second before a reload when no action is available.
 - Target preorder: wait up to 3 seconds for Preorder and 5 seconds after clicking.
-- Amazon checkout: refresh once per second while quantity, update, or unavailable-item errors remain.
+- Lower-level Amazon checkout worker: refresh once per second while quantity, update, or unavailable-item errors remain. The direct-buy worker adds its own one-second checkout delay on top of the per-loop settle wait.
 
 Verification is detected through URL, title, and body-text patterns. The legacy
 workers pause CAPTCHA, robot-check, Press and hold, and access-denied pages for
@@ -599,11 +599,14 @@ configured item price limit.
 
 The worker builds the direct Buy Now checkout URL from that current token and
 does not add the item to the cart. While checkout reports quantity, update, or
-unavailable-item errors, it retries that URL once per second. Every ten such
-responses it revisits offer discovery and switches to a newly issued qualifying
-token when one is available. Final submission still requires expected-product
-evidence and an order total within the configured limit. Place order is clicked
-at most once per run; a nonconfirmed post-click result is terminal and ambiguous.
+unavailable-item errors, it retries that URL after an additional one-second
+checkout delay plus the one-second per-loop page-settle wait and navigation
+time. Product retries add the default two-second delay to that settle wait.
+Every ten unavailable checkout responses it revisits offer discovery and
+switches to a newly issued qualifying token when one is available. Final
+submission still requires expected-product evidence and an order total within
+the configured limit. Place order is clicked at most once per run; a
+nonconfirmed post-click result is terminal and ambiguous.
 If Amazon presents an explicit recent-purchase or duplicate-order warning, the
 worker may select its affirmative consent and click one order-anyway confirmation.
 That exception is gated by duplicate-warning text and cannot reopen the ordinary
@@ -650,6 +653,38 @@ file. Worker output records offer discovery, retries, refreshed tokens,
 verification/sign-in pauses, duplicate confirmation, submission, and terminal
 results. Checkout URLs, offer tokens, order IDs, authorization values, cookies,
 and session tokens are redacted; page bodies and account details are excluded.
+
+### What the available run history does and does not prove
+
+- A **checkout-only** run was reported confirmed after 107 unavailable-item
+  retries. That shows retrying a transient checkout URL can recover; it does
+  not establish a reusable offer token or prove the checkout-only script has
+  the direct-buy worker's seller, price, and line-item guards.
+- A later direct-buy run found a qualifying Amazon offer at `$26.87`; the user
+  reported that the purchase succeeded. The surviving retrospective local
+  log also records an ambiguous submission rather than an independently
+  captured `AMAZON_ORDER_CONFIRMED` event. Treat it as a **user-reported**
+  outcome, not evidence that every branch of the current worker was observed
+  succeeding end-to-end.
+- Subsequent local runs recorded a product wait that later found an offer,
+  a **supplied checkout token being replaced** by a fresh eligible offer,
+  checkout refreshes, token rotations, a manual verification pause, Continue
+  clicks, offer revalidation failures, and a product watch with no qualifying
+  offer. These runs were stopped without a recorded order confirmation.
+  `AMAZON_PRODUCT_REFRESH`, `AMAZON_DIRECT_CHECKOUT_FOUND`, and
+  `AMAZON_PLACE_ORDER_CLICKED` do not by themselves prove a placed order.
+- The earlier logs did **not** show a duplicate-order warning. The explicit
+  duplicate-consent branch and scoped checkout evidence were exercised by
+  offline tests, not proven by those live runs. Browser markup, account
+  authentication, and CDP availability on a different device remain
+  device-specific; local logs are gitignored and do not sync with a clone.
+
+For device setup, skill discovery, script ownership, state meanings, and safe
+stops, follow [Amazon direct buy and preorder](./README.md#amazon-direct-buy-and-preorder).
+The dedicated Chrome profile is local to each device. An existing CDP endpoint
+is reused before profile overrides are considered; sign in to the actual
+connected browser context rather than assuming another device's session
+carried over.
 
 ## Amazon checkout state machine
 

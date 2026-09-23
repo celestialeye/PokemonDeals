@@ -101,7 +101,13 @@ The repository skill `.github/skills/amazon-buy/SKILL.md` supports
 `/amazon-buy <Amazon product or direct Buy Now URL>`. That invocation
 authorizes exactly one quantity-one Amazon order and launches the
 single-product direct-buy worker with the documented `$10000` fail-safe
-ceilings.
+ceilings. It is project-scoped: on another device start Copilot CLI in this
+clone, run `/skills reload` after updates, and check `/skills info amazon-buy`.
+Its launcher reuses CDP at port `9444` or starts a device-local dedicated
+Chrome profile; Amazon authentication is not shared across devices. The
+checkout-only `amazon:checkout` command is **not** the guarded skill path.
+See the Amazon section of `README.md` for inputs, process lifetime, events,
+and safe-stop behavior.
 
 ## Architecture
 
