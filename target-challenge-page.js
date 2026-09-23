@@ -4,6 +4,8 @@
  * See TARGET-CHALLENGE-DEVELOPER-GUIDE.md for ownership and timeout boundaries.
  */
 const { challengeKind, detectChallenge } = require("./target-challenge");
+const holdName = /^\s*press\s*(?:&|and)\s*hold\b/i;
+const holdText = /^\s*press\s*(?:&|and)\s*hold\s*$/i;
 
 /**
  * Bound waiting for one operation, not an entire background input routine.
@@ -83,6 +85,7 @@ async function visibleScopes(page, run) {
     }
     return scopes;
   }
+
   // Retain a locator-only path for compatible adapters and unit-test fakes.
   for (let index = 0; index < scopes.length; index += 1) {
     const scope = scopes[index];
@@ -102,6 +105,62 @@ async function visibleScopes(page, run) {
     }
   }
   return scopes;
+}
+
+async function challengeScopes(page, run) {
+  try {
+    return await visibleScopes(page, run);
+  } catch (error) {
+    if (typeof page.frames !== "function") {
+      throw error;
+    }
+    const frames = page.frames();
+    if (frames.length > 64) {
+      throw new Error("CHALLENGE_FRAME_LIMIT");
+    }
+    return [
+      page,
+      ...frames.filter((frame) => frame.parentFrame()),
+    ].slice(0, 32);
+  }
+}
+
+/**
+ * Find one visible supported Press & Hold control. This fallback intentionally
+ * tolerates an unreadable frame body when the browser still exposes a unique
+ * actionable control, as the live widget can render its copy in a closed-shadow
+ * iframe whose body text is not readable through every driver path.
+ */
+async function findPressAndHoldControl(page, run) {
+  const scopes = await challengeScopes(page, run);
+  const candidates = [];
+  for (const role of [true, false]) {
+    for (const scope of scopes) {
+      const matches = role
+        ? scope.getByRole("button", { name: holdName })
+        : scope.getByText(holdText);
+      const count = await run(() => matches.count());
+      if (count > 16) {
+        throw new Error("CHALLENGE_CONTROL_AMBIGUOUS");
+      }
+      for (let index = 0; index < count; index += 1) {
+        const candidate = matches.nth(index);
+        if (
+          (await run(() => candidate.isVisible())) &&
+          (await run(() => candidate.isEnabled()))
+        ) {
+          candidates.push(candidate);
+        }
+      }
+    }
+    if (candidates.length > 0) {
+      break;
+    }
+  }
+  if (candidates.length > 1) {
+    throw new Error("CHALLENGE_CONTROL_AMBIGUOUS");
+  }
+  return candidates[0] || null;
 }
 
 /**
@@ -129,7 +188,7 @@ async function inspectChallenge(page, { timeoutMs = 5000 } = {}) {
     }
     const url = page.url();
     const title = await run(() => page.title());
-    const scopes = await visibleScopes(page, run);
+    const scopes = await challengeScopes(page, run);
     let readableContent = false;
     let detection = detectChallenge({ url, title });
     for (const scope of scopes) {
@@ -144,16 +203,45 @@ async function inspectChallenge(page, { timeoutMs = 5000 } = {}) {
         detection = evidence;
       }
     }
+    // A generic title or main-page message can coexist with the actionable
+    // Press & Hold control in a frame. Inspect that control before returning
+    // the less specific classification.
+    if (detection.kind === challengeKind.generic) {
+      const control = await findPressAndHoldControl(page, run).catch(() => null);
+      if (control) {
+        return { detected: true, kind: challengeKind.pressAndHold };
+      }
+    }
     if (detection.detected) {
       return detection;
     }
     // A blank/loading page is not evidence of successful recovery.
-    return readableContent && /^(?:https?|file):/i.test(url)
-      ? detection
+    if (readableContent && /^(?:https?|file):/i.test(url)) {
+      return detection;
+    }
+    const control = await findPressAndHoldControl(page, run).catch(() => null);
+    return control
+      ? { detected: true, kind: challengeKind.pressAndHold }
       : unknown;
   } catch (error) {
-    return unknown;
+    // Recovery may inspect many frames. A fresh timeout for each query can
+    // turn one page inspection into minutes of silence; share one fallback
+    // budget across all control lookups.
+    const fallbackDeadline = Date.now() + Math.min(timeoutMs, 1000);
+    const control = await findPressAndHoldControl(
+      page,
+      (operation) => withTimeout(operation, fallbackDeadline - Date.now()),
+    ).catch(() => null);
+    return control
+      ? { detected: true, kind: challengeKind.pressAndHold }
+      : unknown;
   }
 }
 
-module.exports = { inspectChallenge, visibleScopes, withTimeout };
+module.exports = {
+  challengeScopes,
+  findPressAndHoldControl,
+  inspectChallenge,
+  visibleScopes,
+  withTimeout,
+};

@@ -19,6 +19,11 @@ const automaticPurchaseModeOrder = Object.freeze([
   "preorder",
   "add-to-cart",
 ]);
+const directBuyPurchaseModeOrder = Object.freeze([
+  "buy-now",
+  "preorder",
+  "add-to-cart",
+]);
 
 function normalizeLabel(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -37,6 +42,8 @@ function normalizeRequestedPurchaseMode(value, { allowAuto = false } = {}) {
     addtocart: "add-to-cart",
     "buy-now": "buy-now",
     buynow: "buy-now",
+    "direct-buy": "direct-buy",
+    directbuy: "direct-buy",
   };
   if (allowAuto && normalized === "auto") {
     return "auto";
@@ -71,10 +78,13 @@ function selectPurchaseCandidate(candidates, requestedMode) {
       mode: purchaseModeFromLabel(candidate.label),
     }))
     .filter((candidate) => candidate.mode);
-  if (normalizedMode !== "auto") {
+  if (normalizedMode !== "auto" && normalizedMode !== "direct-buy") {
     return indexed.find((candidate) => candidate.mode === normalizedMode) || null;
   }
-  for (const mode of automaticPurchaseModeOrder) {
+  const automaticModes = normalizedMode === "direct-buy"
+    ? directBuyPurchaseModeOrder
+    : automaticPurchaseModeOrder;
+  for (const mode of automaticModes) {
     const candidate = indexed.find((entry) => entry.mode === mode);
     if (candidate) {
       return candidate;
@@ -134,6 +144,7 @@ function validateCartContents(
 module.exports = {
   products,
   automaticPurchaseModeOrder,
+  directBuyPurchaseModeOrder,
   isCartSuccess,
   isPurchaseAction,
   normalizeRequestedPurchaseMode,

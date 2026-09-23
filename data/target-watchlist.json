@@ -1,0 +1,52 @@
+{
+  "products": [
+    {
+      "group": "Initial list",
+      "label": "Elite Trainer Box",
+      "shortUrl": "https://howl.link/99668grkawccg",
+      "expectedProductId": "A-1010892076"
+    },
+    {
+      "group": "Initial list",
+      "label": "Poster Collection",
+      "shortUrl": "https://howl.link/kou0m5sh2jb1i",
+      "expectedProductId": "A-1010892067"
+    },
+    {
+      "group": "Initial list",
+      "label": "Greninja ex Box",
+      "shortUrl": "https://howl.link/5pnf40xriju4t",
+      "expectedProductId": "A-1010892065"
+    },
+    {
+      "group": "Initial list",
+      "label": "Tech Sticker Collection",
+      "shortUrl": "https://howl.link/eu3yhn7a7r9fd",
+      "expectedProductId": "A-1010892078"
+    },
+    {
+      "group": "Ascended Heroes",
+      "label": "Booster Bundle",
+      "shortUrl": "https://howl.link/33zkvcx7vh0yu",
+      "expectedProductId": "A-95120834"
+    },
+    {
+      "group": "Ascended Heroes",
+      "label": "Mega Meganium ex",
+      "shortUrl": "https://howl.link/4m2hzta20003p",
+      "expectedProductId": "A-1012644665"
+    },
+    {
+      "group": "Ascended Heroes",
+      "label": "Mega Fraligatr ex",
+      "shortUrl": "https://howl.link/e63540pamwslq",
+      "expectedProductId": "A-1012644666"
+    },
+    {
+      "group": "Ascended Heroes",
+      "label": "Mega Emboar ex",
+      "shortUrl": "https://howl.link/nronye46gbp6l",
+      "expectedProductId": "A-1012644667"
+    }
+  ]
+}

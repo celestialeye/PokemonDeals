@@ -154,8 +154,10 @@ async function resolveChallenge({
 
   const attemptLimit = Math.max(1, maxAttempts);
   let lastError = null;
+  let attempted = 0;
 
   for (let attempt = 1; attempt <= attemptLimit; attempt += 1) {
+    attempted = attempt;
     log(`TARGET_CHALLENGE_SOLVE_ATTEMPT ${attempt}/${attemptLimit} ${reason}`);
     try {
       await solver({
@@ -170,6 +172,11 @@ async function resolveChallenge({
     } catch (error) {
       lastError = error;
       log(`TARGET_CHALLENGE_SOLVE_ERROR ${error.message}`);
+      // Retrying the same unsupported kind immediately cannot change the
+      // widget. The monitor will re-inspect it during a later recovery cycle.
+      if (error.message === "CHALLENGE_KIND_UNSUPPORTED") {
+        break;
+      }
       continue;
     }
 
@@ -184,7 +191,7 @@ async function resolveChallenge({
   // but stayed blocked. A later verified clearance would already have returned.
   return {
     outcome: lastError ? resolutionOutcome.failed : resolutionOutcome.unresolved,
-    attempts: attemptLimit,
+    attempts: attempted,
     error: lastError ? lastError.message : null,
   };
 }

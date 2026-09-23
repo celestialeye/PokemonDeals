@@ -1,4 +1,5 @@
 const { productIdFromUrl, validateCartContents } = require("./target-products");
+const { inspectChallenge } = require("./target-challenge-page");
 
 const checkoutUrl = "https://www.target.com/checkout";
 const verificationPattern =
@@ -10,6 +11,14 @@ const confirmationPattern =
 const decimalCurrencyPattern = /\$\s*\d+(?:,\d{3})*\.\d{2}\b/;
 const signInPattern =
   /\bsign in\b.*(?:checkout|continue)|(?:checkout|continue).*\bsign in\b/i;
+const signInPagePattern =
+  /sign in to your target account|sign in to continue|log in to continue|enter your password|create an account to continue/i;
+const fulfillmentPatterns = Object.freeze({
+  shipping: /^(?:shipping|ship|ship it)$/i,
+  delivery: /^delivery$/i,
+  pickup: /^(?:pickup|order pickup)$/i,
+  "drive-up": /^drive[\s-]?up$/i,
+});
 const paymentSetupPattern =
   /add (?:a )?(?:payment method|credit or debit card)|enter card information|payment method required|select a payment method/i;
 const unavailablePattern =
@@ -54,6 +63,181 @@ function normalizeFulfillment(value) {
     "drive up": "drive-up",
     "drive-up": "drive-up",
   }[normalized] || null;
+}
+
+function fulfillmentTextMatches(text, expectedFulfillment) {
+  const pattern = fulfillmentPatterns[expectedFulfillment];
+  if (!pattern) {
+    return false;
+  }
+  return pattern.test(
+    String(text || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/\s*(?:\((?:selected|available)\)|,\s*selected)\s*$/i, ""),
+  );
+}
+
+async function readFulfillmentControlState(control) {
+  const attributes = {};
+  for (const name of [
+    "aria-checked",
+    "aria-selected",
+    "aria-pressed",
+    "data-selected",
+    "data-state",
+    "class",
+  ]) {
+    attributes[name] = await control.getAttribute(name).catch(() => null);
+  }
+  let checked = false;
+  if (typeof control.isChecked === "function") {
+    checked = await control.isChecked().catch(() => false);
+  }
+  if (!checked && typeof control.locator === "function") {
+    const nestedInput = control.locator('input[type="radio"]').first();
+    if ((await nestedInput.count().catch(() => 0)) > 0) {
+      checked = await nestedInput.isChecked().catch(() => false);
+    }
+  }
+  const selectedValue = Object.values(attributes)
+    .filter(Boolean)
+    .join(" ");
+  return checked ||
+    /^(?:true|checked|selected|active)$/i.test(
+      String(attributes["aria-checked"] || ""),
+    ) ||
+    /^(?:true|selected|active)$/i.test(
+      String(attributes["aria-selected"] || ""),
+    ) ||
+    /^(?:true|selected|active)$/i.test(
+      String(attributes["aria-pressed"] || ""),
+    ) ||
+    /^(?:true|selected|active)$/i.test(
+      String(attributes["data-selected"] || ""),
+    ) ||
+    /^(?:checked|selected|active)/i.test(
+      String(attributes["data-state"] || ""),
+    ) ||
+    /\b(?:checked|selected|active)\b/i.test(selectedValue);
+}
+
+async function findFulfillmentControl(
+  page,
+  expectedFulfillment,
+) {
+  if (!fulfillmentPatterns[expectedFulfillment]) {
+    return null;
+  }
+  const candidates = page.locator(
+    'button, [role="radio"], [role="tab"], label',
+  );
+  const selected = [];
+  const ready = [];
+  for (let index = 0; index < (await candidates.count().catch(() => 0)); index += 1) {
+    const candidate = candidates.nth(index);
+    if (!(await candidate.isVisible().catch(() => false))) {
+      continue;
+    }
+    const label =
+      await candidate.getAttribute("aria-label").catch(() => null) ||
+      await candidate.getAttribute("title").catch(() => null) ||
+      await candidate.innerText().catch(() => "");
+    if (!fulfillmentTextMatches(label, expectedFulfillment)) {
+      continue;
+    }
+    const isSelected = /,\s*selected\s*$/i.test(label) ||
+      await readFulfillmentControlState(candidate);
+    if (isSelected) {
+      selected.push(candidate);
+      continue;
+    }
+    if (await candidate.isEnabled().catch(() => false)) {
+      ready.push(candidate);
+    }
+  }
+  if (selected.length === 1) {
+    return { control: selected[0], selected: true, ambiguous: false };
+  }
+  if (selected.length > 1 || ready.length > 1) {
+    return { control: null, selected: false, ambiguous: true };
+  }
+  if (ready.length === 1) {
+    return { control: ready[0], selected: false, ambiguous: false };
+  }
+  return null;
+}
+
+async function findProductFulfillmentControl(page, expectedFulfillment) {
+  if (!fulfillmentPatterns[expectedFulfillment]) {
+    return null;
+  }
+  const region = page.locator(
+    'main [role="region"][aria-label="Fulfillment"]',
+  );
+  const regionCount = await region.count();
+  if (regionCount !== 1) {
+    return regionCount > 1
+      ? { control: null, selected: false, ambiguous: true }
+      : null;
+  }
+  if (!(await region.isVisible().catch(() => false))) {
+    return null;
+  }
+  if ((await region.getAttribute("data-test")) !==
+      "module-product-detail-fulfillment-v1") {
+    // Target sometimes replaces fulfillment choices with a selected
+    // shipping summary. Require destination ZIP and arrival wording inside
+    // the unique Fulfillment region, not Shipping & Returns elsewhere.
+    const summary = await region.innerText().catch(() => "");
+    if (
+      expectedFulfillment === "shipping" &&
+      /\bShip to\s+\d{5}\b/i.test(summary) &&
+      /\bArrives by\b/i.test(summary) &&
+      !/\b(?:pickup|drive[\s-]?up|delivery)\b/i.test(summary)
+    ) {
+      return { control: null, selected: true, ambiguous: false };
+    }
+    return null;
+  }
+
+  const buttons = region.locator("button");
+  const matches = [];
+  for (let index = 0; index < await buttons.count(); index += 1) {
+    const button = buttons.nth(index);
+    if (!(await button.isVisible())) {
+      continue;
+    }
+    const label = await button.getAttribute("aria-label") || await button.innerText();
+    const name = String(label).replace(/\s+/g, " ").trim();
+    const expectedName = expectedFulfillment === "drive-up"
+      ? /^drive[\s-]?up\b/i
+      : new RegExp(`^${expectedFulfillment}\\b`, "i");
+    if (!expectedName.test(name)) {
+      continue;
+    }
+    if (
+      expectedFulfillment === "shipping" &&
+      (await button.getAttribute("id")) !== "SHIPPING"
+    ) {
+      continue;
+    }
+    matches.push({ button, name });
+  }
+  if (matches.length > 1) {
+    return { control: null, selected: false, ambiguous: true };
+  }
+  if (matches.length === 0) {
+    return null;
+  }
+  const { button, name } = matches[0];
+  const selected = /,\s*selected\s*$/i.test(name) ||
+    await readFulfillmentControlState(button);
+  return {
+    control: selected || await button.isEnabled() ? button : null,
+    selected,
+    ambiguous: false,
+  };
 }
 
 function currencyValues(text) {
@@ -129,6 +313,45 @@ function readPurchaseGuardConfig(env = process.env, { required = true } = {}) {
       { required },
     ),
   };
+}
+
+/**
+ * Convert the checkout cart view to the strict submission-guard shape.
+ * Checkout may show only a collapsed "1 item" summary; that alone cannot
+ * establish TCIN, quantity, fulfillment, or price. A summary/line-item
+ * quantity disagreement invalidates the evidence instead of guessing.
+ */
+function purchaseEvidenceFromCartView(cartView) {
+  const cartItems = Array.isArray(cartView?.cart_items)
+    ? cartView.cart_items
+    : [];
+  const summaryQuantity = Number(cartView?.summary?.items_quantity);
+  const items = cartItems.map((item) => {
+    const tcin = String(item?.tcin || "");
+    const quantity = Number(item?.quantity);
+    const price = String(item?.current_price ?? "");
+    return {
+      productId: /^\d{7,}$/.test(tcin) ? `A-${tcin}` : null,
+      quantity: Number.isInteger(quantity) ? quantity : null,
+      itemPriceCents: /^\d+(?:\.\d{1,2})?$/.test(price)
+        ? Math.round(Number(price) * 100)
+        : null,
+      fulfillment: normalizeFulfillment(item?.fulfillment?.type),
+    };
+  });
+  const total = String(cartView?.summary?.grand_total ?? "");
+  const orderTotalCents = /^\d+(?:\.\d{1,2})?$/.test(total)
+    ? Math.round(Number(total) * 100)
+    : null;
+  if (
+    !Number.isInteger(summaryQuantity) ||
+    items.some((item, index) =>
+      item.quantity !== Number(cartItems[index]?.total_cart_item_quantity ?? item.quantity)) ||
+    items.reduce((sum, item) => sum + (item.quantity || 0), 0) !== summaryQuantity
+  ) {
+    return { items: [], orderTotalCents: null };
+  }
+  return { items, orderTotalCents };
 }
 
 function validatePdpIdentity(url, expectedProductId) {
@@ -304,6 +527,9 @@ function classifyCheckoutSnapshot(snapshot) {
   if (snapshot.highDemandReady) {
     return "high-demand";
   }
+  if (snapshot.fulfillmentReady) {
+    return "select-fulfillment";
+  }
   if (snapshot.saveContinueReady) {
     return "save-continue";
   }
@@ -330,13 +556,58 @@ async function isReady(locator) {
   );
 }
 
+/**
+ * Scope PIN input to its dialog and require one editable input. A broad /pin/
+ * label search also matches "Shipping" and previously selected its Edit link.
+ * The fallback uses a whole-word PIN label intersected with input elements.
+ */
+async function findPinInput(page) {
+  const dialogs = page.getByRole("dialog").filter({
+    hasText: /confirm your pin/i,
+  });
+  if ((await dialogs.count()) === 1) {
+    const inputs = dialogs.first().locator('input:not([type="hidden"])');
+    if ((await inputs.count()) === 1) {
+      const input = inputs.first();
+      if ((await input.isVisible()) && (await input.isEnabled())) {
+        return input;
+      }
+    }
+  }
+  const labeledInputs = page.getByLabel(/\bpin\b/i).and(page.locator("input"));
+  if ((await labeledInputs.count()) !== 1) {
+    return null;
+  }
+  const input = labeledInputs.first();
+  return (await input.isVisible()) && (await input.isEnabled())
+    ? input
+    : null;
+}
+
+/** Main-page text misses Press & Hold inside a visible iframe; inspect both. */
 async function hasPageVerification(page) {
   if (/captcha|challenge|blocked|verify/i.test(page.url())) {
     return true;
   }
   const title = await page.title().catch(() => "");
   const bodyText = await page.locator("body").innerText().catch(() => "");
-  return verificationPattern.test(`${title}\n${bodyText}`);
+  if (verificationPattern.test(`${title}\n${bodyText}`)) {
+    return true;
+  }
+  return (await inspectChallenge(page)).detected;
+}
+
+async function hasPageSignIn(page) {
+  if (/\/(?:login|signin|sign-in)(?:[/?#]|$)/i.test(page.url())) {
+    return true;
+  }
+  const title = await page.title().catch(() => "");
+  const bodyText = await page.locator("body").innerText().catch(() => "");
+  return signInPagePattern.test(`${title}\n${bodyText}`) ||
+    (
+      signInPattern.test(bodyText) &&
+      /password|email|account/i.test(bodyText)
+    );
 }
 
 async function readCartEvidence(page) {
@@ -396,8 +667,13 @@ function quantityFromText(text) {
   return unique.length === 1 ? unique[0] : null;
 }
 
-async function readPurchaseEvidence(page) {
+async function readPurchaseEvidence(page, {
+  expectedFulfillment = null,
+} = {}) {
   const bodyText = await page.locator("body").innerText().catch(() => "");
+  const selectedFulfillment = expectedFulfillment
+    ? await findFulfillmentControl(page, expectedFulfillment)
+    : null;
   const rowSelector = [
     '[data-test="cartItem"]',
     '[data-test="cart-item"]',
@@ -440,7 +716,9 @@ async function readPurchaseEvidence(page) {
         hrefs.map(productIdFromUrl).find(Boolean) ||
         productIdFromUrl(rowText),
       quantity: Number.isInteger(quantity) ? quantity : quantityFromText(rowText),
-      fulfillment: detectFulfillment(rowText),
+      fulfillment:
+        detectFulfillment(rowText) ||
+        (selectedFulfillment?.selected ? expectedFulfillment : null),
       itemPriceCents: parseUnambiguousCurrencyCents(rowText),
     });
   }
@@ -471,7 +749,9 @@ async function readPurchaseEvidence(page) {
       items.push({
         productId: detectedIds.length === 1 ? detectedIds[0] : null,
         quantity: quantityFromText(summaryText),
-        fulfillment: detectFulfillment(summaryText),
+        fulfillment:
+          detectFulfillment(summaryText) ||
+          (selectedFulfillment?.selected ? expectedFulfillment : null),
         itemPriceCents: parseLabeledCurrencyCents(
           summaryText,
           /item price|subtotal/i,
@@ -512,11 +792,45 @@ function validateExpectedCart(evidence, expectedProductIds) {
   );
 }
 
-async function snapshotCheckoutPage(page) {
+async function inspectExactCart(page, expectedProductId) {
+  const rows = page.locator('[data-test="cartItem"]');
+  const rowCount = await rows.count();
+  if (rowCount === 0) {
+    const body = await page.locator("body").innerText();
+    return emptyCartPattern.test(body) ? "empty" : "blocked";
+  }
+  if (rowCount !== 1) {
+    return "blocked";
+  }
+  const row = rows.first();
+  if (!(await row.isVisible())) {
+    return "blocked";
+  }
+  const hrefs = await row.locator("a[href]").evaluateAll((anchors) =>
+    anchors.map((anchor) => anchor.href),
+  );
+  const productIds = [...new Set(hrefs.map(productIdFromUrl).filter(Boolean))];
+  const quantity = row.locator(
+    'select[data-test="cartItem-qty-stepper"], [data-test="cartItem-qty-stepper"] select',
+  );
+  if (
+    productIds.length !== 1 ||
+    productIds[0] !== expectedProductId ||
+    (await quantity.count()) !== 1 ||
+    (await quantity.inputValue()) !== "1"
+  ) {
+    return "blocked";
+  }
+  return "matched";
+}
+
+async function snapshotCheckoutPage(page, {
+  expectedFulfillment = null,
+} = {}) {
   const bodyText = await page.locator("body").innerText().catch(() => "");
   const visibleDialogs = page.locator('[role="dialog"]');
   const pinHeading = page.getByText(/^confirm your pin$/i).first();
-  const pinInput = page.getByLabel(/enter pin|pin/i).first();
+  const pinInput = await findPinInput(page);
   const pinConfirm = page.getByRole("button", { name: /^confirm$/i }).first();
   const highDemand = page.getByText(highDemandPattern).first();
   const highDemandDialog = page
@@ -532,6 +846,9 @@ async function snapshotCheckoutPage(page) {
   const placeOrder = page
     .getByRole("button", { name: /^place(?: your)? order$/i })
     .first();
+  const fulfillment = expectedFulfillment
+    ? await findFulfillmentControl(page, expectedFulfillment)
+    : null;
 
   const pinVisible =
     (await pinHeading.count()) > 0 &&
@@ -564,13 +881,25 @@ async function snapshotCheckoutPage(page) {
   return {
     bodyText,
     buyNowPanelVisible,
-    controls: { highDemandOk, pinConfirm, pinInput, placeOrder, saveContinue },
+    controls: {
+      fulfillment: fulfillment?.control || null,
+      highDemandOk,
+      pinConfirm,
+      pinInput,
+      placeOrder,
+      saveContinue,
+    },
+    fulfillmentAmbiguous: Boolean(fulfillment?.ambiguous),
+    fulfillmentSelected: Boolean(fulfillment?.selected),
+    fulfillmentReady: Boolean(fulfillment?.control && !fulfillment.selected),
     state: classifyCheckoutSnapshot({
       verificationVisible: await hasPageVerification(page),
       confirmed: isOrderConfirmed(page.url(), bodyText),
-      safetyStop: signInPattern.test(bodyText)
-        ? "sign-in-required"
-        : paymentSetupPattern.test(bodyText)
+      safetyStop: pinVisible && (!pinInput || !(await isReady(pinConfirm)))
+        ? "pin-input-unavailable"
+        : await hasPageSignIn(page)
+          ? "sign-in-required"
+          : paymentSetupPattern.test(bodyText)
           ? "payment-setup-required"
           : unavailablePattern.test(bodyText)
             ? "item-unavailable"
@@ -579,6 +908,7 @@ async function snapshotCheckoutPage(page) {
               : null,
       pinReady: pinVisible && (await isReady(pinInput)) && (await isReady(pinConfirm)),
       highDemandReady: highDemandVisible && (await isReady(highDemandOk)),
+      fulfillmentReady: Boolean(fulfillment?.control && !fulfillment.selected),
       saveContinueReady: await isReady(saveContinue),
       placeOrderReady: await isReady(placeOrder),
       onCartPage: /target\.com\/cart(?:[/?#]|$)/i.test(page.url()),
@@ -665,6 +995,7 @@ async function runTargetCheckout({
   maximumRecoveries = 2,
   snapshotReader = snapshotCheckoutPage,
   evidenceReader = readPurchaseEvidence,
+  handleSignIn = null,
   log = console.log,
   error = console.error,
 }) {
@@ -683,6 +1014,26 @@ async function runTargetCheckout({
     });
   }
 
+  // Target can redirect to /cart during any await. Call this before and after
+  // each checkout snapshot; never inspect or solve the cart-page challenge.
+  // After Place order, a redirect is ambiguous and must not trigger another
+  // checkout attempt because the original click may already have succeeded.
+  const returnFromCart = async () => {
+    if (buyNow || !/target\.com\/cart(?:[/?#]|$)/i.test(page.url())) {
+      return null;
+    }
+    if (progress.snapshot().submissionMayHaveOccurred) {
+      error("PLACE_ORDER_OUTCOME_AMBIGUOUS cart-redirect");
+      return "ambiguous";
+    }
+    log("TARGET_CHECKOUT_CART_REDIRECT");
+    await page.goto(checkoutUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 15000,
+    });
+    return "redirected";
+  };
+
   const runLoop = async () => {
     while (true) {
       if (page.isClosed()) {
@@ -700,10 +1051,19 @@ async function runTargetCheckout({
       log("CHECKOUT_PAUSED_BY_GLOBAL_CIRCUIT_BREAKER");
       return "blocked";
     }
+    const preReadRedirect = await returnFromCart();
+    if (preReadRedirect === "ambiguous") {
+      return "ambiguous";
+    }
+    if (preReadRedirect === "redirected") {
+      continue;
+    }
     let snapshot;
     try {
       await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
-      snapshot = await snapshotReader(page);
+      snapshot = await snapshotReader(page, {
+        expectedFulfillment: purchaseGuardConfig?.expectedFulfillment || null,
+      });
     } catch (snapshotError) {
       if (progress.snapshot().submissionMayHaveOccurred) {
         error(`PLACE_ORDER_OUTCOME_AMBIGUOUS snapshot-error ${snapshotError.message}`);
@@ -718,6 +1078,13 @@ async function runTargetCheckout({
       }
       log("CHECKOUT_PAUSED_BY_GLOBAL_CIRCUIT_BREAKER");
       return "blocked";
+    }
+    const postReadRedirect = await returnFromCart();
+    if (postReadRedirect === "ambiguous") {
+      return "ambiguous";
+    }
+    if (postReadRedirect === "redirected") {
+      continue;
     }
     const observed = progress.observe(snapshot.state);
     if (buyNow && snapshot.buyNowPanelVisible) {
@@ -776,6 +1143,7 @@ async function runTargetCheckout({
 
     if (
       [
+        "pin-input-unavailable",
         "sign-in-required",
         "payment-setup-required",
         "item-unavailable",
@@ -785,6 +1153,17 @@ async function runTargetCheckout({
       if (progress.snapshot().submissionMayHaveOccurred) {
         error(`PLACE_ORDER_OUTCOME_AMBIGUOUS post-submit-${snapshot.state}`);
         return "ambiguous";
+      }
+      if (snapshot.state === "sign-in-required" && handleSignIn) {
+        const signInResult = await handleSignIn(page);
+        if (signInResult === "resolved") {
+          if (!progress.recordAction("sign-in", 3)) {
+            error("CHECKOUT_BLOCKED sign-in-repeated");
+            return "blocked";
+          }
+          progress.markProgress();
+          continue;
+        }
       }
       error(`CHECKOUT_BLOCKED ${snapshot.state}`);
       return "blocked";
@@ -803,7 +1182,9 @@ async function runTargetCheckout({
         await snapshot.controls.pinInput.fill(targetPin);
         await snapshot.controls.pinConfirm.click({ timeout: 5000 });
       } catch (clickError) {
-        error(`PIN_CONTROL_REPLACED ${clickError.message}`);
+        // Browser action errors can embed fill("PIN"); keep terminal output
+        // categorical. The JSONL sanitizer cannot retract printed stdout.
+        error("PIN_CONTROL_REPLACED");
         continue;
       }
       log("PIN_CONFIRMED");
@@ -825,6 +1206,29 @@ async function runTargetCheckout({
         continue;
       }
       log("HIGH_DEMAND_OK_CLICKED");
+      progress.markProgress();
+      await page.waitForTimeout(500);
+      continue;
+    }
+
+    if (snapshot.state === "select-fulfillment") {
+      if (!progress.recordAction("select-fulfillment", 3)) {
+        error("CHECKOUT_BLOCKED fulfillment-selection-repeated");
+        return "blocked";
+      }
+      if (!snapshot.controls.fulfillment) {
+        error("CHECKOUT_BLOCKED fulfillment-control-missing");
+        return "blocked";
+      }
+      try {
+        await snapshot.controls.fulfillment.click({ timeout: 5000 });
+      } catch (clickError) {
+        error(`FULFILLMENT_CONTROL_REPLACED ${clickError.message}`);
+        continue;
+      }
+      log(
+        `TARGET_FULFILLMENT_CLICKED ${purchaseGuardConfig?.expectedFulfillment || "unknown"}`,
+      );
       progress.markProgress();
       await page.waitForTimeout(500);
       continue;
@@ -864,10 +1268,15 @@ async function runTargetCheckout({
     if (snapshot.state === "place-order") {
       buyNowEngaged = true;
       if (progress.snapshot().submissionMayHaveOccurred) {
+        // A PIN-confirmed order completed in a run that observed this button
+        // again. Its presence cannot justify a second
+        // click or prove failure; independent order evidence is required.
         error("PLACE_ORDER_OUTCOME_AMBIGUOUS place-order-still-present");
         return "ambiguous";
       }
-      const evidence = await evidenceReader(page);
+      const evidence = await evidenceReader(page, {
+        expectedFulfillment: purchaseGuardConfig?.expectedFulfillment || null,
+      });
       const validation = validatePurchaseEvidence(evidence, {
         expectedProductId: expectedProductIds[0],
         ...purchaseGuardConfig,
@@ -889,6 +1298,8 @@ async function runTargetCheckout({
         return "ready-to-submit";
       }
       log(`PLACE_ORDER_FOUND after ${refreshes} refreshes`);
+      // Latch before dispatch: Target may receive the click even when the
+      // browser acknowledgement fails. PIN confirmation does not clear it.
       progress.markSubmission();
       try {
         await snapshot.controls.placeOrder.click({ timeout: 5000 });
@@ -985,6 +1396,11 @@ module.exports = {
   createCheckoutProgress,
   currencyValues,
   detectFulfillment,
+  findFulfillmentControl,
+  findProductFulfillmentControl,
+  findPinInput,
+  inspectExactCart,
+  hasPageSignIn,
   hasPageVerification,
   highDemandPattern,
   isOrderConfirmed,
@@ -995,6 +1411,7 @@ module.exports = {
   parseMaximumCents,
   parseRetryAfterMs,
   parseUnambiguousCurrencyCents,
+  purchaseEvidenceFromCartView,
   readCartEvidence,
   readPurchaseGuardConfig,
   readPurchaseEvidence,

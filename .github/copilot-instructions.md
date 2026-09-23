@@ -35,15 +35,34 @@ node --check monitor.js
 There are two operator surfaces over the same `deals.js` engine:
 
 - **AI-agent operations:** this is the non-interactive orchestration path. For
-  product polling or purchasing requests, operate through direct `pokemon`
-  subcommands; do not drive the TUI and do not delegate the live operation to
-  the development `/deals` harness.
+  catalog-based product polling or purchasing requests, operate through direct
+  `pokemon` subcommands. A message containing only one valid Target product
+  URL authorizes one quantity-one auto-buy attempt through the main agent and
+  `target-direct-buy.js`, without a mode or routine confirmation prompt. An
+  explicitly invoked `/target-buy <url>` or `/amazon-buy <url>` uses its
+  guarded single-product skill instead. The `/target-buy` launcher cannot
+  bind a bare URL because it requires an invocation event. Do not drive the
+  TUI or delegate the live operation to the development `/deals` harness.
+- **Target watchlist purchase:** the 2026-09-23 overnight request authorizes
+  continuous monitoring and repeated quantity-one orders across the supplied
+  list after each previous order is confirmed. Validate the
+  list into `data/target-watchlist.json` and start one attached
+  `npm run target:watchlist-buy` process. It owns one global polling queue,
+  one cart/checkout owner, Buy Now priority, and the shared purchase mutex.
+  After each confirmed order, it resets the completed transaction and resumes
+  polling all eight products in the same process. A new Place-order click is
+  required for each repeat. Cart-service 429 responses delay cart work while
+  the owner reconciles its transaction; the worker does not clear Target
+  cookies during challenge recovery. Do not run competing Target workers.
+  See `README.md#target-first-available-watchlist`.
 - **Full-screen TUI:** `pokemon` with no arguments opens `src/deals-tui.js`.
   The TUI is still in development and is not the agent automation contract.
 
-The engine registry currently has a Target adapter only. For Amazon or Pokémon
-Center, use the documented legacy direct worker only when the user supplied
-the required scope and inputs.
+The engine registry currently has a Target adapter only. A sole Target URL
+uses the direct-buy worker under the main agent's shared-lock preflight;
+literal `/target-buy <url>` and `/amazon-buy <url>` invocations use their
+repository skills. For Pokémon Center, use the documented legacy direct
+worker only when the user supplied the required scope and inputs.
 
 For an operational request, the main agent is the orchestrator. Inspect
 `pokemon list` and `pokemon settings`, make only the requested
@@ -61,6 +80,11 @@ Report explicit confirmation and every terminal stop. If verification appears,
 allow only the worker's existing bounded recovery/backoff behavior; never
 bypass it or accelerate polling. Report unresolved verification, safety stops,
 ambiguous outcomes, interruptions, and worker failures precisely.
+After a Place-order click, a reappearing button or PIN confirmation does not
+prove failure. Inspect Target Orders for exact product, quantity, and run time
+before any further submission. See
+`docs/target-direct-buy-2026-09-23.md` for the live evidence and the known
+false-ambiguous worker result.
 
 The `/deals` prompt and `.pi` agents are development-only. They may edit and
 verify source offline but never operate a worker or grant purchase authority.
@@ -68,20 +92,26 @@ verify source offline but never operate a worker or grant purchase authority.
 Before running the deals control-plane engine, it checks whether the existing
 authenticated Chrome already exposes CDP on port `9444`, reuses that context
 when available, and automatically launches the configured Windows Chrome
-profile with debugging when it is unavailable. Standalone workers still
-require the documented manual CDP startup. Verify the endpoint with:
+profile with debugging when it is unavailable. `target-direct-buy.js` also
+calls that bootstrap; other standalone workers may require manual CDP
+startup. Verify the endpoint with:
 
 ```powershell
 Invoke-RestMethod 'http://127.0.0.1:9444/json/version'
 ```
 
-The project-scoped `.github/mcp.json` registers Playwright MCP against the same CDP endpoint for browser inspection and testing. Start the authenticated Chrome instance before using that MCP server.
+The project-scoped `.github/mcp.json` registers Playwright MCP against the
+same CDP endpoint for browser inspection and testing. Start the authenticated
+Chrome instance before using that MCP server. The dedicated PokemonDeals
+profile is launched without restoring a crashed prior tab session, so stale
+verification and blank tabs are not resurrected on recovery.
 
 Legacy worker commands are:
 
 ```powershell
 npm run target:checkout
 npm run target:watch
+npm run target:direct-buy
 npm run target:preorder
 npm run pokemoncenter:preorder
 npm run amazon:direct-buy
@@ -97,17 +127,19 @@ orders; `target:preorder` is the cart-monitoring step. Follow the
 environment-variable setup and safety checks in `README.md` before invoking any
 worker.
 
-The repository skill `.github/skills/amazon-buy/SKILL.md` supports
-`/amazon-buy <Amazon product or direct Buy Now URL>`. That invocation
-authorizes exactly one quantity-one Amazon order and launches the
-single-product direct-buy worker with the documented `$10000` fail-safe
-ceilings. It is project-scoped: on another device start Copilot CLI in this
-clone, run `/skills reload` after updates, and check `/skills info amazon-buy`.
-Its launcher reuses CDP at port `9444` or starts a device-local dedicated
-Chrome profile; Amazon authentication is not shared across devices. The
-checkout-only `amazon:checkout` command is **not** the guarded skill path.
-See the Amazon section of `README.md` for inputs, process lifetime, events,
-and safe-stop behavior.
+The repository skills `.github/skills/target-buy/SKILL.md` and
+`.github/skills/amazon-buy/SKILL.md` support one explicitly authorized Target
+or Amazon purchase. `/target-buy <Target product URL>` chooses Buy Now,
+Preorder, then Add to cart by default and delegates checkout to the existing
+Target URL watch; `/amazon-buy <Amazon product or direct Buy Now URL>` launches
+the guarded Amazon direct-buy worker. Both use documented `$10000` fail-safe
+ceilings; Target uses that fallback only when its persisted limits are unset.
+On another device, start Copilot CLI in this clone, run `/skills reload`
+after updates, and check `/skills info amazon-buy`. The Amazon launcher
+reuses CDP at port `9444` or starts a device-local dedicated Chrome profile;
+Amazon authentication is not shared across devices. The checkout-only
+`amazon:checkout` command is **not** the guarded skill path. See the Amazon
+section of `README.md` for inputs, process lifetime, events, and safe stops.
 
 ## Architecture
 
@@ -122,7 +154,7 @@ and safe-stop behavior.
 
 ## Repository-specific conventions
 
-- Keep the code CommonJS. Use Patchright only through the Target URL watch's driver switch and retain `playwright-core` as its fallback and as the driver for existing workers. Use the existing Node assertion/test harness; do not introduce a framework or bundler for routine changes.
+- Keep the code CommonJS. Use Patchright through the Target URL watch's driver switch and retain `playwright-core` as its fallback and as the driver for existing Amazon workers. Use the existing Node assertion/test harness; do not introduce a framework or bundler for routine changes.
 - Pass secrets and transient session data through environment variables only:
   `TARGET_PIN`, `PRODUCT_FILTER`, the `AMAZON_*` inputs, and especially
   `AMAZON_CHECKOUT_URL`. Never hardcode PINs, credentials, or short-lived
@@ -131,5 +163,5 @@ and safe-stop behavior.
 - Use resilient accessible selectors (`getByRole`, `getByText`, and regular expressions) because Target and Amazon vary button labels such as `Place order` and `Place your order`. Check that controls are visible and enabled before clicking.
 - Verification detection intentionally combines URL, title, and body-text patterns. Other workers retain manual handling. Only the Target URL watch supports an explicitly configured press-and-hold solver; preserve independent live inspection, bounded input cleanup, serialized work, and unresolved-challenge backoff. Observe-only normally stops on challenge; `TARGET_CHALLENGE_VALIDATE=1` permits verified recovery only, never unrelated-error or limit resets. Do not deliberately hammer Target to trigger verification.
 - Keep the conservative cadence documented in `SESSION-LEARNINGS.md`: Target checkout waits before reloads, Target preorder waits up to 3 seconds for `Preorder` and 5 seconds after a click, and Amazon checkout refreshes about once per second while quantity errors remain. Faster loops were temporally associated with retailer verification in the preserved session evidence.
-- All workers share the same Chrome profile, cart, payment state, and session. Concurrent workers can interfere with each other and can submit duplicate orders; stop remaining workers immediately after the first explicit confirmation.
+- All workers share the same Chrome profile, cart, payment state, and session. Concurrent workers can interfere with each other and can submit duplicate orders; stop competing workers after the first explicit confirmation. The authorized Target watchlist continues repeat orders inside its sole worker.
 - When changing checkout readiness detection, preserve Target's decimal-currency load signal and its grace period before refreshing. It prevents a populated checkout from being reloaded too aggressively while still allowing recovery from a stalled page.

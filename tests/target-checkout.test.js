@@ -5,8 +5,12 @@ const {
   cartResponseKind,
   classifyCheckoutSnapshot,
   createCheckoutProgress,
+  findPinInput,
+  hasPageVerification,
+  inspectExactCart,
   isOrderConfirmed,
   observeCartHandshake,
+  purchaseEvidenceFromCartView,
   paymentSetupPattern,
   parseLabeledCurrencyCents,
   parseRetryAfterMs,
@@ -17,6 +21,7 @@ const {
   validatePurchaseEvidence,
   validateExpectedCart,
 } = require("../target-checkout");
+const { fakePage } = require("./helpers/target-challenge-fakes");
 
 function snapshot(overrides = {}) {
   return {
@@ -24,6 +29,7 @@ function snapshot(overrides = {}) {
     confirmed: false,
     pinReady: false,
     highDemandReady: false,
+    fulfillmentReady: false,
     saveContinueReady: false,
     placeOrderReady: false,
     onCartPage: false,
@@ -55,10 +61,152 @@ test("checkout state priority preserves verification and transition ordering", (
     "save-continue",
   );
   assert.equal(classifyCheckoutSnapshot(snapshot({ pinReady: true })), "pin");
+  assert.equal(
+    classifyCheckoutSnapshot(snapshot({ fulfillmentReady: true })),
+    "select-fulfillment",
+  );
   assert.equal(classifyCheckoutSnapshot(snapshot({ placeOrderReady: true })), "place-order");
   assert.equal(classifyCheckoutSnapshot(snapshot({ onCartPage: true })), "go-checkout");
   assert.equal(classifyCheckoutSnapshot(snapshot({ priceVisible: true })), "wait-loaded");
   assert.equal(classifyCheckoutSnapshot(snapshot()), "reload");
+});
+
+test("checkout detects Press and Hold in a visible cart frame", async () => {
+  const holdFrame = fakePage({ body: "Press and hold" });
+  const cartPage = fakePage({
+    body: "Cart Total $19.99",
+    controls: [],
+    children: [holdFrame],
+    title: "Cart : Target",
+    url: "https://www.target.com/cart",
+  });
+  assert.equal(await hasPageVerification(cartPage), true);
+});
+
+test("checkout cart view proves one exact shipped item and its prices", () => {
+  assert.deepEqual(purchaseEvidenceFromCartView({
+    cart_items: [{
+      tcin: "90172677",
+      quantity: 1,
+      current_price: 16.39,
+      fulfillment: { type: "SHIP" },
+    }],
+    summary: { items_quantity: 1, grand_total: 16.96 },
+  }), {
+    items: [{
+      productId: "A-90172677",
+      quantity: 1,
+      itemPriceCents: 1639,
+      fulfillment: "shipping",
+    }],
+    orderTotalCents: 1696,
+  });
+  assert.equal(purchaseEvidenceFromCartView({
+    cart_items: [{ tcin: "90172677", quantity: 1 }],
+    summary: { items_quantity: 2, grand_total: 16.96 },
+  }).items.length, 0);
+});
+
+test("PIN input selection stays inside the confirmation dialog", async () => {
+  const pinField = { isVisible: async () => true, isEnabled: async () => true };
+  const page = {
+    getByRole: (role) => {
+      assert.equal(role, "dialog");
+      return {
+        filter: ({ hasText }) => {
+          assert.equal(hasText.test("Confirm your PIN"), true);
+          return {
+            count: async () => 1,
+            first: () => ({
+              locator: (selector) => {
+                assert.match(selector, /input/);
+                return {
+                  count: async () => 1,
+                  first: () => pinField,
+                };
+              },
+            }),
+          };
+        },
+      };
+    },
+    getByLabel: () => {
+      throw new Error("The shipping-address link must not be selected.");
+    },
+  };
+  assert.equal(await findPinInput(page), pinField);
+});
+
+test("checkout returns from cart redirect before reading cart verification", async () => {
+  let path = "/cart";
+  let visits = 0;
+  const page = {
+    ...checkoutPage(),
+    url: () => `https://www.target.com${path}`,
+    goto: async (url) => {
+      assert.equal(url, "https://www.target.com/checkout");
+      visits += 1;
+      path = visits > 5 ? "/checkout" : "/cart";
+    },
+  };
+  const result = await runTargetCheckout({
+    page,
+    expectedProductIds: ["A-1007918679"],
+    purchaseGuardConfig: guardConfig,
+    stopBeforeSubmit: true,
+    snapshotReader: async () => {
+      assert.equal(path, "/checkout");
+      return placeOrderSnapshot(async () => {
+        throw new Error("must not click");
+      });
+    },
+    evidenceReader: async () => validEvidence,
+    log: () => {},
+  });
+  assert.equal(result, "ready-to-submit");
+  assert.equal(visits, 6);
+});
+
+test("checkout returns from a cart redirect that occurs during a snapshot", async () => {
+  let path = "/checkout";
+  let visits = 0;
+  let reads = 0;
+  let verificationCalls = 0;
+  const page = {
+    ...checkoutPage(),
+    url: () => `https://www.target.com${path}`,
+    goto: async (url) => {
+      assert.equal(url, "https://www.target.com/checkout");
+      visits += 1;
+      path = "/checkout";
+    },
+  };
+  const result = await runTargetCheckout({
+    page,
+    expectedProductIds: ["A-1007918679"],
+    purchaseGuardConfig: guardConfig,
+    stopBeforeSubmit: true,
+    snapshotReader: async () => {
+      reads += 1;
+      if (reads === 1) {
+        path = "/cart";
+        return { state: "verification", controls: {} };
+      }
+      assert.equal(path, "/checkout");
+      return placeOrderSnapshot(async () => {
+        throw new Error("must not click");
+      });
+    },
+    handleVerification: async () => {
+      verificationCalls += 1;
+      return "blocked";
+    },
+    evidenceReader: async () => validEvidence,
+    log: () => {},
+  });
+  assert.equal(result, "ready-to-submit");
+  assert.equal(visits, 1);
+  assert.equal(verificationCalls, 0);
 });
 
 test("unexpected payment setup copy is recognized without matching a saved method", () => {
@@ -112,6 +260,60 @@ test("cart endpoint and Retry-After parsing are deterministic", () => {
     10000,
   );
   assert.equal(parseRetryAfterMs("invalid"), 0);
+});
+
+test("existing cart preflight requires one exact product at quantity one", async () => {
+  const cartPage = (items, body = "Cart") => ({
+    locator: (selector) => {
+      if (selector === "body") {
+        return { innerText: async () => body };
+      }
+      assert.equal(selector, '[data-test="cartItem"]');
+      return {
+        count: async () => items.length,
+        first: () => {
+          const item = items[0];
+          return {
+            isVisible: async () => true,
+            locator: (childSelector) => {
+              if (childSelector === "a[href]") {
+                return { evaluateAll: async (callback) =>
+                  callback(item.hrefs.map((href) => ({ href }))) };
+              }
+              assert.match(childSelector, /select\[data-test="cartItem-qty-stepper"\]/);
+              return {
+                count: async () => 1,
+                inputValue: async () => item.quantity,
+              };
+            },
+          };
+        },
+      };
+    },
+  });
+  const expected = "A-90172677";
+  const expectedHref = "https://www.target.com/p/example/-/A-90172677";
+  assert.equal(
+    await inspectExactCart(cartPage([{ hrefs: [expectedHref], quantity: "1" }]), expected),
+    "matched",
+  );
+  assert.equal(
+    await inspectExactCart(cartPage([{ hrefs: [expectedHref], quantity: "2" }]), expected),
+    "blocked",
+  );
+  assert.equal(
+    await inspectExactCart(cartPage([{ hrefs: [expectedHref], quantity: "1" },
+      { hrefs: [expectedHref], quantity: "1" }]), expected),
+    "blocked",
+  );
+  assert.equal(
+    await inspectExactCart(cartPage([{ hrefs: [
+      expectedHref, "https://www.target.com/p/other/-/A-95025127",
+    ], quantity: "1" }]), expected),
+    "blocked",
+  );
+  assert.equal(await inspectExactCart(cartPage([], "Your cart is empty"), expected), "empty");
+  assert.equal(await inspectExactCart(cartPage([], "Loading"), expected), "blocked");
 });
 
 test("cart handshake records mutation and reconciliation without blind waiting", async () => {
@@ -344,6 +546,67 @@ test("stop-before-submit validates and returns without clicking", async () => {
     }),
     evidenceReader: async () => validEvidence,
     log: (message) => logs.push(message),
+  });
+
+  test("shipping fulfillment is selected before Save and continue or Place order", async () => {
+    const states = ["select-fulfillment", "place-order"];
+    let fulfillmentClicks = 0;
+    const logs = [];
+    const result = await runTargetCheckout({
+      page: checkoutPage(),
+      expectedProductIds: ["A-1007918679"],
+      purchaseGuardConfig: guardConfig,
+      stopBeforeSubmit: true,
+      snapshotReader: async () => {
+        const state = states.shift();
+        if (state === "select-fulfillment") {
+          return {
+            state,
+            controls: {
+              fulfillment: {
+                click: async () => { fulfillmentClicks += 1; },
+              },
+            },
+          };
+        }
+        return placeOrderSnapshot(async () => {
+          throw new Error("must not click");
+        });
+      },
+      evidenceReader: async () => validEvidence,
+      log: (message) => logs.push(message),
+    });
+    assert.equal(result, "ready-to-submit");
+    assert.equal(fulfillmentClicks, 1);
+    assert.ok(logs.includes("TARGET_FULFILLMENT_CLICKED shipping"));
+    assert.equal(logs.some((message) => message.startsWith("TARGET_FULFILLMENT_SELECTED")), false);
+  });
+
+  test("checkout pauses for manual sign-in and resumes after the session clears", async () => {
+    const states = ["sign-in-required", "place-order"];
+    let signInWaits = 0;
+    const result = await runTargetCheckout({
+      page: checkoutPage(),
+      expectedProductIds: ["A-1007918679"],
+      purchaseGuardConfig: guardConfig,
+      stopBeforeSubmit: true,
+      handleSignIn: async () => {
+        signInWaits += 1;
+        return "resolved";
+      },
+      snapshotReader: async () => {
+        const state = states.shift();
+        return state === "place-order"
+          ? placeOrderSnapshot(async () => {
+            throw new Error("must not click");
+          })
+          : { state, controls: {} };
+      },
+      evidenceReader: async () => validEvidence,
+      log: () => {},
+    });
+    assert.equal(result, "ready-to-submit");
+    assert.equal(signInWaits, 1);
   });
   assert.equal(result, "ready-to-submit");
   assert.equal(clicks, 0);

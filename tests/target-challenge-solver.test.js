@@ -21,7 +21,12 @@ test("native hold releases and driver independently verifies same-document recov
     verifyCleared: async () => !(await inspectChallenge(page)).detected,
   });
   assert.equal(result.outcome, "cleared");
-  assert.deepEqual(page.events, ["hover", ["move", 50, 40], "down", "up", "dispose"]);
+  assert.equal(page.events[0], "hover");
+  assert.deepEqual(page.events[1], ["move", 50, 40]);
+  assert.equal(page.events[2], "down");
+  assert.equal(page.events.at(-2), "up");
+  assert.equal(page.events.at(-1), "dispose");
+  assert.ok(page.events.filter((event) => Array.isArray(event)).length > 1);
 });
 
 test("discovers nested frames and both label forms", async () => {
@@ -70,14 +75,16 @@ test("retains element identity when progress changes its label", async () => {
   assert.ok(page.state.released);
 });
 
-test("releases early when the held control disappears", async () => {
+test("holds through temporary control disappearance until clear evidence", async () => {
   const page = fakePage();
   const time = fakeTime(() => {
     page.nodes[0].visible = false;
-    page.state.body = "Pokemon product";
+    if (time.now() >= 900) {
+      page.state.body = "Pokemon product";
+    }
   });
   await solver(time)(context(page));
-  assert.equal(time.now(), 100);
+  assert.equal(time.now(), 900);
   assert.ok(page.state.released);
 });
 
@@ -106,6 +113,18 @@ test("partial pointer-down failure releases and sanitizes browser errors", async
   page.mouse.down = async () => { throw new Error("https://secret.example/?token=secret"); };
   await assert.rejects(() => solver()(context(page)), /^Error: CHALLENGE_BROWSER_ACTION_FAILED$/);
   assert.ok(page.events.includes("up"));
+});
+
+test("browser action failures report a safe stage without exposing browser URLs", async () => {
+  const page = fakePage();
+  page.mouse.down = async () => { throw new Error("https://secret.example/?token=secret"); };
+  const logs = [];
+  await assert.rejects(() => solver()({
+    ...context(page),
+    log: (message) => logs.push(message),
+  }), /CHALLENGE_BROWSER_ACTION_FAILED/);
+  assert.ok(logs.includes("TARGET_CHALLENGE_ACTION_FAILED stage=pointer-down"));
+  assert.ok(logs.every((message) => !message.includes("secret.example")));
 });
 
 test("cleanup failures are failures, not successful attempts", async () => {
@@ -161,5 +180,5 @@ test("a hung pointer command times out and cannot start later solver stages", as
   assert.ok(page.events.includes("up"));
   finishDown();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(logs.length, 0);
+  assert.deepEqual(logs, ["TARGET_CHALLENGE_ACTION_FAILED stage=pointer-down"]);
 });

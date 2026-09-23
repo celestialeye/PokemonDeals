@@ -5,10 +5,12 @@
  * No fresh Chrome profile is needed. See TARGET-CHALLENGE-DEVELOPER-GUIDE.md.
  */
 const { challengeKind } = require("./target-challenge");
-const { inspectChallenge, visibleScopes, withTimeout } = require("./target-challenge-page");
+const {
+  findPressAndHoldControl,
+  inspectChallenge,
+  withTimeout,
+} = require("./target-challenge-page");
 
-const holdName = /^\s*press\s*(?:&|and)\s*hold\b/i;
-const holdText = /^\s*press\s*(?:&|and)\s*hold\s*$/i;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Reject malformed timing settings rather than silently accepting unsafe delays. */
@@ -53,39 +55,11 @@ function createSolver({ env = process.env, now = Date.now, wait = sleep } = {}) 
     let handle;
     let releaseRequired = false;
     let failure;
+    let stage = "control-discovery";
 
     try {
       while (!control && now() < discoveryDeadline) {
-        const candidates = [];
-        const scopes = await visibleScopes(page, run);
-        // Prefer actionable roles globally; a paragraph with the same text is not a button.
-        for (const role of [true, false]) {
-          for (const scope of scopes) {
-            const matches = role
-              ? scope.getByRole("button", { name: holdName })
-              : scope.getByText(holdText);
-            const count = await run(() => matches.count());
-            if (count > 16) {
-              throw new Error("CHALLENGE_CONTROL_AMBIGUOUS");
-            }
-            for (let index = 0; index < count; index += 1) {
-              const candidate = matches.nth(index);
-              if ((await run(() => candidate.isVisible())) &&
-                  (await run(() => candidate.isEnabled()))) {
-                candidates.push(candidate);
-              }
-            }
-          }
-          if (candidates.length > 0) {
-            break;
-          }
-        }
-        // Picking an arbitrary first match could press a duplicate or unrelated
-        // control. The visibility checks and uniqueness requirement are intentional.
-        if (candidates.length > 1) {
-          throw new Error("CHALLENGE_CONTROL_AMBIGUOUS");
-        }
-        control = candidates[0];
+        control = await findPressAndHoldControl(page, run);
         if (!control) {
           await wait(Math.min(100, Math.max(1, discoveryDeadline - now())));
         }
@@ -94,31 +68,34 @@ function createSolver({ env = process.env, now = Date.now, wait = sleep } = {}) 
         throw new Error("CHALLENGE_CONTROL_NOT_FOUND");
       }
       // Hover performs browser hit-target/actionability checks, including overlays.
+      stage = "hover";
       await run(() => control.hover({ timeout: Math.max(1, remaining()) }));
+      stage = "element-handle";
       handle = await run(() => control.elementHandle({ timeout: Math.max(1, remaining()) }));
       if (!handle) {
         throw new Error("CHALLENGE_CONTROL_DETACHED");
       }
+      stage = "geometry";
       const box = await run(() => handle.boundingBox());
       if (!box || box.width <= 0 || box.height <= 0) {
         throw new Error("CHALLENGE_CONTROL_NO_GEOMETRY");
       }
+      stage = "pointer-move";
       await run(() => page.mouse.move(box.x + box.width / 2, box.y + box.height / 2));
       // Set BEFORE awaiting down: Chrome may receive input even if the protocol
       // acknowledgement fails. The finally block must still attempt mouse-up.
       releaseRequired = true;
+      stage = "pointer-down";
       await run(() => page.mouse.down({ button: "left" }));
       log("TARGET_CHALLENGE_HOLD_STARTED");
+      stage = "hold";
       while (remaining() > 0) {
         if (page.isClosed()) {
           throw new Error("CHALLENGE_PAGE_UNAVAILABLE");
         }
-        // Retain element identity: changing the accessible label during progress
-        // must not cause an early release. Detach/navigation is verified by the driver.
-        const visible = await run(() => handle.isVisible().catch(() => false));
-        if (!visible) {
-          break;
-        }
+        // Retain the native hold even if the provider temporarily hides or
+        // replaces the control. Only an independent readable clear signal or
+        // the bounded attempt deadline may end the hold.
         const evidence = await inspectChallenge(page, {
           timeoutMs: Math.min(250, Math.max(1, remaining())),
         });
@@ -126,11 +103,17 @@ function createSolver({ env = process.env, now = Date.now, wait = sleep } = {}) 
           break;
         }
         if (remaining() > 0) {
+          await run(() =>
+            page.mouse.move(box.x + box.width / 2, box.y + box.height / 2),
+          );
+        }
+        if (remaining() > 0) {
           await wait(Math.min(100, remaining()));
         }
       }
     } catch (error) {
       // Browser errors may include sensitive frame/request URLs. Keep logs categorical.
+      log(`TARGET_CHALLENGE_ACTION_FAILED stage=${stage}`);
       failure = new Error(/^CHALLENGE_[A-Z_]+$/.test(error.message)
         ? error.message
         : "CHALLENGE_BROWSER_ACTION_FAILED");

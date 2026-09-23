@@ -85,7 +85,7 @@ The coordinator distinguishes three conditions:
 
 | State | Meaning |
 |---|---|
-| `pausedUntil` | Temporary failure backoff. Successful verified recovery resets the escalation ladder. |
+| `pausedUntil` | Challenge backoff. Successful verified recovery resets the escalation ladder. Cart-service throttling has its own deadline. |
 | `calibrationStopped` | Terminal observe-only error. Solving later must not erase unrelated errors or ordinary calibration's stop decision. |
 | `challengePending` | Explicit validation mode is resolving an API challenge. Another queued request must not start until resolution clears this barrier. |
 
@@ -97,9 +97,9 @@ Successful recovery clears the request template, deferred signal, stock summary,
 
 The real widget's actionable iframe was inside a **closed shadow root**, with hidden iframe copies nearby. Ordinary CSS iframe enumeration missed the live control. `visibleScopes()` therefore prefers `page.frames()` and checks each frame owner's **entire ancestor chain** for visibility. Each visible frame is included once; the main page is included separately.
 
-The helper caps raw frames at 64 and total visible scopes at 32. Locator-only adapters/fakes retain a bounded `frameLocator()` traversal. The code does not open shadow roots, remove overlays, or inject synthetic pointer events.
+The helper caps raw frames at 64 and total visible scopes at 32. Locator-only adapters/fakes retain a bounded `frameLocator()` traversal. The fallback after a failed page read shares one deadline across all control lookups; giving every frame a fresh timeout can leave the monitor silent for far longer than the configured inspection budget. The code does not open shadow roots, remove overlays, or inject synthetic pointer events.
 
-`inspectChallenge()` reads the main URL/title and body text in the visible scopes under one read deadline. Positive evidence is retained across scopes; a later clean frame cannot erase it. Specific press-and-hold text takes precedence over a generic block classification.
+`inspectChallenge()` reads the main URL/title and body text in the visible scopes under one read deadline. Positive evidence is retained across scopes; a later clean frame cannot erase it. Specific press-and-hold text takes precedence over a generic block classification. A generic verification title can coexist with a visible Press & Hold control in a frame, so the inspector looks for that control before returning the generic kind. If a frame body is unreadable but the browser still exposes exactly one visible/enabled supported control, the inspector uses it as bounded positive evidence. Missing or ambiguous controls remain unreadable/blocked.
 
 **Unreadable is not clean.** Closed pages, empty/transitional pages, frame/read failures, or exceeded inspection bounds produce `{ detected: true, kind: "generic", unreadable: true }`. The monitor will not start a solver on this initial unknown state, and the verifier will not count it as clearance. Do not “fix” a read failure by substituting empty text and declaring success.
 
@@ -109,11 +109,18 @@ The helper caps raw frames at 64 and total visible scopes at 32. Locator-only ad
 2. Validate timing configuration and establish one deadline. Discovery reserves a small margin for pointer-down rather than consuming the entire attempt searching.
 3. Search visible scopes for an enabled button role named `Press & Hold` or `Press and hold`. Only if no eligible role control exists does it consider exact text matches. More than one candidate is an error, not a reason to choose `.first()`.
 4. Hover with actionability checks, retain an `ElementHandle`, and obtain current geometry. Browser coordinates are calculated at runtime; screenshot coordinates are never hardcoded. Retaining the handle prevents a progress-label change from looking like disappearance of the held element.
-5. Set the release flag **before** awaiting pointer-down. The browser may have received input even if its acknowledgement fails. Keep holding while the challenge remains present; release when readable clean-page evidence appears, the held element disappears, or the per-attempt safety budget expires. Element disappearance is still not proof of clearance.
+5. Set the release flag **before** awaiting pointer-down. The browser may have received input even if its acknowledgement fails. Keep holding while the challenge remains present; release only after stable independent clean-page evidence or the per-attempt safety budget expires. Element disappearance is not proof of clearance.
 6. Attempt pointer-up in `finally`, including error/navigation/detach cases. Preserve the primary error if cleanup also fails. Disposing the handle releases an object reference, not the DOM element.
 7. Wait for live clearance within the remaining budget. A spinner, changed label, or `Please try again` message must not be treated as success. Return control to the driver for its own settle and independent verification.
 
-The bundled solver does not recursively retry, reload the page between attempts, create tabs, clear cookies, rotate profiles, or modify the request queue. A refresh-before-second-attempt policy existed only in a live diagnostic harness; that branch was not needed in the passing run and is not a shipped feature.
+The bundled solver does not recursively retry, reload the page between attempts,
+create tabs, clear cookies, rotate profiles, or modify the request queue. The
+direct-buy route disables its former automatic Target-cookie reset. A failed
+browser action emits only its stage, never the underlying browser URL. An
+unsupported generic kind uses one attempt per cycle; later cycles re-inspect
+the live page. The `/target-buy` driver may refresh its worker-owned page
+after a failed Press & Hold cycle, then re-inspect; legacy watch runs retain
+the no-refresh default.
 
 ### Timing is layered, not one global cancellation mechanism
 
@@ -125,7 +132,7 @@ See [README configuration](./README.md#target-url-availability-watch) for defaul
 | Attempt budget | Solver discovery, dynamic hold, and completion waiting, default 20 seconds. |
 | Cleanup allowance | Up to 1000 ms for release and 500 ms for handle disposal beyond the action deadline. |
 | Settle interval | Driver delay after a normally returned attempt, default 1500 ms, before another independent read. |
-| Attempt count | Driver; default three consecutive attempts on the page left by the previous attempt. |
+| Attempt count | Driver; up to three consecutive supported attempts by default. An unsupported kind uses one attempt in a cycle, then returns to monitor recovery. |
 | Backoff | Monitor; follows an exhausted/failed cycle, not every individual hold. |
 
 `withTimeout()` bounds waiting for one operation. `Promise.race()` does **not** cancel a browser command already dispatched. It must not wrap an entire input routine that could continue issuing later clicks after timeout. A lost browser connection may prevent release; fail closed rather than promising guaranteed cleanup.
@@ -148,11 +155,13 @@ For future operational verification, prefer the user's existing profile in obser
 |---|---|
 | `TARGET_CHALLENGE_DETECTED` | Readable challenge evidence was found; not a solve result. |
 | `TARGET_CHALLENGE_HOLD_STARTED` | Pointer-down returned normally; the solver is now waiting for readable clearance evidence or its attempt budget. |
+| `TARGET_CHALLENGE_ACTION_FAILED stage=...` | Categorical browser-input failure stage. No browser error URL or token is logged. |
 | `TARGET_CHALLENGE_HOLD_FINISHED elapsedMs=...` | Total attempt telemetry, including discovery, dynamic hold, cleanup, and completion waiting; **not success**. |
 | `TARGET_CHALLENGE_CLEARED` | The driver's independent post-attempt verification passed. |
-| `TARGET_CHALLENGE_SOLVED` | Monitor recovery/reset was recorded; still check subsequent API evidence. |
+| `TARGET_CHALLENGE_SOLVED` | Monitor recovery was recorded; still check subsequent API evidence. |
 | `TARGET_CHALLENGE_BACKOFF` | Unsupported, unreadable, unresolved, or failed recovery paused the worker. |
 | `TARGET_API_POLL` | Transport evidence is recorded before JSON parsing. HTTP 200 alone is insufficient: require a valid availability payload too. |
+| `TARGET_MONITOR_HEARTBEAT` | Current owner, challenge/cart cooldown, and age of the last availability poll; continued logging is not proof of a recovered challenge. |
 | `CHALLENGE_CONTROL_NOT_FOUND` | Discovery expired; inspect the preserved page's frame structure/labels rather than inventing coordinates. |
 | `CHALLENGE_CONTROL_AMBIGUOUS` | More than one eligible match (or excessive matches); investigate duplicates/visibility. |
 | `CHALLENGE_KIND_UNSUPPORTED` | The built-in solver must not interact with this generic block. |
@@ -161,6 +170,12 @@ For future operational verification, prefer the user's existing profile in obser
 The summary's `challengeCount` counts challenged **API polls**, not all DOM-only challenges. A run can therefore have `challengeCount: 0` and `challengeSolvedCount: 1` without contradicting its live detection logs.
 
 Never log captured request URLs/bodies, cookies, API keys, or challenge tokens. Preserve categorical errors, timings, sanitized state transitions, and redacted screenshots instead. A widget saying `Please try again` remains blocked; retries are bounded, and neither repetition nor refresh guarantees acceptance.
+
+For the 2026-09-23 direct-buy session, checkout-page and product-page challenge
+ownership differed. See [the session record](./docs/target-direct-buy-2026-09-23.md)
+for observed behavior and the checkout-first correction. It also records why a
+successful order may still produce an ambiguous worker result after PIN
+confirmation.
 
 ## 8. Tests and what has actually been proven
 
