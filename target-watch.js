@@ -205,7 +205,10 @@ async function waitForPausedPages(
       // product tab must not clear a verification pause on checkout.
       const challengePage = job.addedToCart && job.checkoutPage
         ? job.checkoutPage
-        : job.preflightChallengePending && job.preflightPage
+        : (job.preflightChallengePending ||
+            (job.requestedMode === "direct-buy" &&
+              job.pendingCartReconciliation)) &&
+            job.preflightPage
           ? job.preflightPage
           : job.page;
       let detection;
@@ -1365,7 +1368,35 @@ async function reconcilePendingCart(job, monitorState, {
     if (new URL(job.page.url()).pathname === "/cart") {
       return "pending";
     }
-  } else {
+  }
+  if (job.requestedMode === "direct-buy") {
+    if (monitorState.isCartRateLimited()) {
+      return "pending";
+    }
+    // A cart mutation may succeed while the PDP shows verification. The
+    // checkout cart view is the authority for the already-owned transaction.
+    const status = await checkoutPreflight(job, monitorState, {
+      ...(redirectedToCart
+        ? { openPage: async () => job.page }
+        : {}),
+      mutationOwned: true,
+    });
+    if (status === "matched") {
+      return continueCheckout(job, monitorState, {
+        notify,
+        challengeOptions,
+        checkoutRunner,
+      });
+    }
+    if (status === "empty") {
+      job.pendingCartReconciliation = false;
+      job.purchaseMode = null;
+      job.cartRetryPending = true;
+      return "retry-cart";
+    }
+    return status;
+  }
+  if (!redirectedToCart) {
     const challengeResult = await handleChallenge(
       job,
       monitorState,
@@ -1398,32 +1429,6 @@ async function reconcilePendingCart(job, monitorState, {
     ? ""
     : await job.page.locator("body").innerText().catch(() => "");
   if (redirectedToCart || !isCartSuccess(job.page.url(), body)) {
-    if (job.requestedMode === "direct-buy") {
-      // Reconcile uncertain cart input from /checkout; never visit /cart or
-      // replay the product action before validating exact identity there.
-      const status = await checkoutPreflight(job, monitorState, {
-        ...(job.redirectedCartCheckout
-          ? { openPage: async () => job.page }
-          : {}),
-        mutationOwned: true,
-      });
-      if (status === "matched") {
-        return continueCheckout(job, monitorState, {
-          notify,
-          challengeOptions,
-          checkoutRunner,
-        });
-      }
-      if (status === "empty") {
-        // The checkout cart is authoritative: the prior click did not leave
-        // this item there. Retain ownership for one fresh product action.
-        job.pendingCartReconciliation = false;
-        job.purchaseMode = null;
-        job.cartRetryPending = true;
-        return "retry-cart";
-      }
-      return status;
-    }
     console.log(`${job.product.id} PURCHASE_RESULT_UNCONFIRMED`);
     return "pending";
   }
@@ -1606,6 +1611,23 @@ async function triggerPurchase(job, monitorState, source, summary, candidate, {
           });
         }
       }
+      return;
+    }
+
+    if (job.requestedMode === "direct-buy") {
+      const cartStatus = await checkoutPreflight(job, monitorState, {
+        retainPage: true,
+        mutationOwned: true,
+      });
+      if (cartStatus === "matched") {
+        await continueCheckout(job, monitorState, {
+          notify,
+          challengeOptions,
+          checkoutRunner,
+        });
+      }
+      // An empty immediate read can precede a delayed cart update. Keep
+      // ownership and recheck checkout on the next tick before another click.
       return;
     }
 
@@ -1809,6 +1831,7 @@ async function rearmConfirmedJob(job, monitorState, {
 async function pollAvailability(job, monitorState, {
   checkoutRunner = continueCheckout,
   rearmRunner = rearmConfirmedJob,
+  reconcileRunner = reconcilePendingCart,
   retryRunner = retryCartPurchase,
 } = {}) {
   if (
@@ -1867,9 +1890,10 @@ async function pollAvailability(job, monitorState, {
   }
 
   if (job.pendingCartReconciliation &&
-      new URL(job.page.url()).pathname === "/cart") {
+      (job.requestedMode === "direct-buy" ||
+        new URL(job.page.url()).pathname === "/cart")) {
     await monitorState.enqueueMutation(() =>
-      reconcilePendingCart(job, monitorState),
+      reconcileRunner(job, monitorState),
     );
     return;
   }
@@ -1893,7 +1917,7 @@ async function pollAvailability(job, monitorState, {
 
   if (job.pendingCartReconciliation) {
     await monitorState.enqueueMutation(() =>
-      reconcilePendingCart(job, monitorState),
+      reconcileRunner(job, monitorState),
     );
     return;
   }

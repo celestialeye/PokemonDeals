@@ -609,7 +609,11 @@ cart reads and mutations according to `Retry-After` or an adaptive fallback;
 it does not mark all availability requests as rate limited. An uncertain cart
 click retains the purchase owner, checks `/checkout`, and retries the product
 action only after the cart is explicitly empty. A redirect to `/cart` is sent
-back to `/checkout` without inspecting the cart challenge. One
+back to `/checkout` without inspecting the cart challenge. After a cart
+mutation, direct buy reads the checkout cart before inspecting the product
+tab's verification page. An exact quantity-one match transfers the
+transaction to checkout; an empty immediate read retains ownership for
+another checkout read before any fresh Add to cart click. One
 confirmed order releases checkout so the same worker resumes all eight
 products, including the one just ordered. Each repeat starts from a fresh
 product page and requires a new Place-order click before it counts as

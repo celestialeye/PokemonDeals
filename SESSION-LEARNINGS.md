@@ -571,6 +571,27 @@ cannot claim that a generic challenge is solved without independent page
 clearance; a post-Place-order ambiguity requires read-only order-history
 reconciliation before another submission.
 
+### Checkout-first cart handoff (2026-09-25)
+
+In a live seven-product watchlist run, Target accepted one cart mutation for
+Pitch Black Bundle, but the product tab showed Press & Hold. A separate
+checkout preflight tab had earlier redirected to `/cart`. While the worker
+retried the product-tab challenge, a read-only `/checkout` cart view showed
+one matching Shipping item at quantity one. Navigating the challenged
+product tab to `/checkout` let the worker validate checkout and click Place
+order once. The resulting screen was ambiguous after PIN confirmation;
+Target Orders then confirmed a new matching quantity-one order. The runner
+resumed its watchlist after that history confirmation.
+
+Direct-buy cart actions now recheck the retained `/checkout` cart view before
+handling the product-tab challenge. Pending cart reconciliation and pause
+clearance prefer checkout as well. An empty immediate read keeps ownership
+until checkout is checked again. A new Place-order click still requires
+fresh item, quantity, fulfillment, price, and total evidence; an ambiguous
+post-click result requires read-only order-history reconciliation. Offline
+tests cover this routing change; an automatic live post-add handoff has not
+yet been observed.
+
 Discord credentials remain in `DISCORD_WEBHOOK_URL` and are passed to the Python `discord.py` helper through the child-process environment, never command arguments or source files.
 
 ## Target press-and-hold implementation and evidence (2026-09-18)
