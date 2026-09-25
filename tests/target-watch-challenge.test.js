@@ -602,6 +602,31 @@ test("preflight challenge pause follows the retained checkout tab", async () => 
   assert.ok(inspected.every((page) => page === preflightPage));
 });
 
+test("pending cart pause follows checkout instead of challenged product tab", async () => {
+  let now = 1000;
+  const state = stateFor({ observe: false, now: () => now });
+  const job = jobFor(fakePage({ body: "Press & Hold" }), "direct-buy");
+  const checkoutPage = fakePage({ body: "Checkout" });
+  job.pendingCartReconciliation = true;
+  job.preflightPage = checkoutPage;
+  state.claimPurchase(job.product.id);
+  state.pauseForChallenge("post-add verification", {
+    fixed: true,
+    productId: job.product.id,
+  });
+  const inspected = [];
+  assert.equal(await waitForPausedPages([job], state, {
+    inspect: async (page) => {
+      inspected.push(page);
+      return page === checkoutPage
+        ? { detected: false, kind: "none" }
+        : { detected: true, kind: "press_and_hold" };
+    },
+    waitFor: async () => { now += 1000; },
+  }), true);
+  assert.ok(inspected.every((page) => page === checkoutPage));
+});
+
 test("solving one paused product keeps other challenge owners paused", () => {
   let now = 0;
   const state = stateFor({ observe: false, now: () => now });
@@ -1020,6 +1045,14 @@ test("single-product cart action transfers its retained preflight tab to checkou
           rateLimited: false,
         };
       },
+      checkoutPreflight: (owner, monitor, options) =>
+        inspectDirectBuyCheckout(owner, monitor, {
+          ...options,
+          openPage: async () => preflight,
+          inspectPage: async () => ({ detected: false }),
+          readCartView: async () => matchingCartView(),
+          log: () => {},
+        }),
       checkoutRunner: async ({ page: checkoutPage }) => {
         assert.equal(checkoutPage, preflight);
         assert.equal(closed, 0);
@@ -1249,7 +1282,7 @@ test("matched direct-buy cart proceeds to checkout before reading the product ta
 });
 
 test("pending direct-buy cart reconciliation proceeds to guarded checkout from exact checkout view", async () => {
-  const productPage = fakePage({ body: "Product" });
+  const productPage = fakePage({ body: "Quick verification Press & Hold" });
   productPage.getByText = () => ({ first: () => ({ count: async () => 0 }) });
   const job = jobFor(productPage, "direct-buy");
   job.purchaseMode = "add-to-cart";
@@ -1264,6 +1297,11 @@ test("pending direct-buy cart reconciliation proceeds to guarded checkout from e
   let checkoutCalls = 0;
   const status = await reconcilePendingCart(job, state, {
     notify: noWait,
+    challengeOptions: {
+      inspect: async () => {
+        throw new Error("Product challenge must not precede checkout cart view.");
+      },
+    },
     checkoutPreflight: (owner, monitor) => inspectDirectBuyCheckout(owner, monitor, {
       openPage: async () => checkoutPage,
       inspectPage: async () => ({ detected: false }),
@@ -1281,6 +1319,80 @@ test("pending direct-buy cart reconciliation proceeds to guarded checkout from e
   assert.equal(checkoutCalls, 1);
   assert.equal(job.pendingCartReconciliation, false);
   assert.equal(state.isOrderConfirmed(), true);
+});
+
+test("direct-buy post-add checks checkout before product challenge", async () => {
+  const page = fakePage({ body: "Product" });
+  const job = jobFor(page, "direct-buy");
+  job.preflightPage = {};
+  const state = stateFor({ observe: false });
+  let preflights = 0;
+  let checkouts = 0;
+  await state.enqueueMutation(() => triggerPurchase(
+    job,
+    state,
+    "test",
+    null,
+    {
+      label: "Add to cart",
+      mode: "add-to-cart",
+      button: {
+        click: async () => { page.state.body = "Quick verification Press & Hold"; },
+      },
+    },
+    {
+      notify: noWait,
+      multiDirectBuy: true,
+      checkoutPreflight: async () => {
+        preflights += 1;
+        if (preflights === 1) return "empty";
+        job.checkoutPage = {};
+        job.addedToCart = true;
+        job.pendingCartReconciliation = false;
+        return "matched";
+      },
+      cartHandshake: async (_page, click) => {
+        await click();
+        return {
+          mutation: { kind: "mutation", status: 201, retryAfterMs: 0 },
+          reconciliation: null,
+          rateLimited: false,
+        };
+      },
+      checkoutRunner: async () => {
+        checkouts += 1;
+        return "confirmed";
+      },
+      challengeOptions: {
+        inspect: async () => {
+          throw new Error("Product challenge must not precede checkout cart view.");
+        },
+      },
+    },
+  ));
+  assert.equal(preflights, 2);
+  assert.equal(checkouts, 1);
+  assert.equal(state.isOrderConfirmed(), true);
+});
+
+test("pending direct-buy cart is reconciled before product inspection", async () => {
+  const page = fakePage({ body: "Press & Hold" });
+  page.isClosed = () => {
+    throw new Error("Product challenge must not precede cart reconciliation.");
+  };
+  const job = jobFor(page, "direct-buy");
+  job.purchaseMode = "add-to-cart";
+  job.pendingCartReconciliation = true;
+  const state = stateFor({ observe: false });
+  state.claimPurchase(job.product.id);
+  let reconciliations = 0;
+  await pollAvailability(job, state, {
+    reconcileRunner: async () => {
+      reconciliations += 1;
+      return "pending";
+    },
+  });
+  assert.equal(reconciliations, 1);
 });
 
 test("direct-buy preflight refuses an ambiguous checkout view without another purchase", async () => {
